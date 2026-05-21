@@ -1,0 +1,22 @@
+[project]
+name = "secapi-client"
+version = "0.3.1"
+description = "Python SDK for SEC API"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+authors = [
+  { name = "Autonomous Computer" }
+]
+
+[project.urls]
+Homepage = "https://secapi.ai/developers"
+Documentation = "https://docs.secapi.ai"
+Repository = "https://github.com/secapi-ai/secapi-python"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["omni_datastream_py", "secapi_client"]
