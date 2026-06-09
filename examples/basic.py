@@ -6,12 +6,10 @@ from secapi_client import SecApiClient
 base_url = (
     os.environ.get("SECAPI_BASE_URL")
     or os.environ.get("SECAPI_API_BASE_URL")
-    or os.environ.get("OMNI_DATASTREAM_BASE_URL")
-    or os.environ.get("OMNI_DATASTREAM_API_BASE_URL")
     or "https://api.secapi.ai"
 )
 client = SecApiClient(
-    api_key=os.environ.get("SECAPI_API_KEY") or os.environ["OMNI_DATASTREAM_API_KEY"],
+    api_key=os.environ["SECAPI_API_KEY"],
     base_url=base_url,
 )
 
@@ -28,6 +26,6 @@ print(client.market_calendar(market="XNYS", duration=3))
 print(client.volatility_signal(ticker="AAPL"))
 print(client.latest_13f(cik="0001067983", limit=5))
 print(client.insiders(ticker="AAPL", limit=5))
-if os.environ.get("OMNI_OPERATOR_API_KEY"):
-    operator_client = SecApiClient(api_key=os.environ["OMNI_OPERATOR_API_KEY"], base_url=base_url)
+if os.environ.get("SECAPI_OPERATOR_API_KEY"):
+    operator_client = SecApiClient(api_key=os.environ["SECAPI_OPERATOR_API_KEY"], base_url=base_url)
     print(operator_client.observability())
