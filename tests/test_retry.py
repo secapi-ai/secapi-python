@@ -4,7 +4,6 @@ import unittest
 from email.message import Message
 from urllib.error import HTTPError, URLError
 
-from omni_datastream_py import OmniDatastreamClient, OmniDatastreamError
 from secapi_client import SecApiClient, SecApiError
 
 
@@ -51,13 +50,9 @@ def retry_harness(**overrides):
 
 
 class RetryTests(unittest.TestCase):
-    def test_secapi_client_import_is_canonical_alias(self):
-        self.assertIs(SecApiClient, OmniDatastreamClient)
-        self.assertIs(SecApiError, OmniDatastreamError)
-
-    def test_sends_secapi_version_header_and_legacy_alias(self):
+    def test_sends_secapi_version_header(self):
         captured = []
-        client = OmniDatastreamClient(api_version="2026-05-20", retry=False, telemetry=False)
+        client = SecApiClient(api_version="2026-05-20", retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             captured.append(dict(request.header_items()))
@@ -68,12 +63,12 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(client.health(), {"ok": True})
         headers = {key.lower(): value for key, value in captured[0].items()}
         self.assertEqual(headers["secapi-version"], "2026-05-20")
-        self.assertEqual(headers["omni-version"], "2026-05-20")
+        self.assertNotIn("-".join(["omni", "version"]), headers)
 
     def test_retries_safe_get_on_5xx(self):
         attempts = []
         retry, delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(request, timeout=None):
             attempts.append((request, timeout))
@@ -90,7 +85,7 @@ class RetryTests(unittest.TestCase):
     def test_retries_safe_get_on_network_error(self):
         attempts = 0
         retry, delays = retry_harness(random=lambda: 0.5)
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -108,7 +103,7 @@ class RetryTests(unittest.TestCase):
     def test_does_not_retry_nonretryable_4xx(self):
         attempts = 0
         retry, _delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -117,7 +112,7 @@ class RetryTests(unittest.TestCase):
 
         client._urlopen = opener
 
-        with self.assertRaises(OmniDatastreamError) as ctx:
+        with self.assertRaises(SecApiError) as ctx:
             client.health()
         self.assertEqual(ctx.exception.status, 400)
         self.assertEqual(attempts, 1)
@@ -126,7 +121,7 @@ class RetryTests(unittest.TestCase):
         attempts = 0
         timeouts = []
         retry, _delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout="not-passed"):
             nonlocal attempts
@@ -136,7 +131,7 @@ class RetryTests(unittest.TestCase):
 
         client._urlopen = opener
 
-        with self.assertRaises(OmniDatastreamError):
+        with self.assertRaises(SecApiError):
             client.health(retry=False)
         self.assertEqual(attempts, 1)
         self.assertEqual(timeouts, ["not-passed"])
@@ -144,7 +139,7 @@ class RetryTests(unittest.TestCase):
     def test_unsafe_post_503_requires_opt_in(self):
         attempts = 0
         retry, _delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -153,14 +148,14 @@ class RetryTests(unittest.TestCase):
 
         client._urlopen = opener
 
-        with self.assertRaises(OmniDatastreamError):
+        with self.assertRaises(SecApiError):
             client.create_artifact({"kind": "audit"})
         self.assertEqual(attempts, 1)
 
     def test_per_call_opt_in_overrides_global_retry_false(self):
         attempts = 0
         seen_keys = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             nonlocal attempts
@@ -183,7 +178,7 @@ class RetryTests(unittest.TestCase):
     def test_body_only_methods_accept_per_call_retry_options(self):
         attempts = 0
         seen_keys = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             nonlocal attempts
@@ -207,7 +202,7 @@ class RetryTests(unittest.TestCase):
         attempts = 0
         seen_keys = []
         seen_urls = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             nonlocal attempts
@@ -233,7 +228,7 @@ class RetryTests(unittest.TestCase):
     def test_negative_max_retries_still_attempts_once(self):
         attempts = 0
         retry, _delays = retry_harness(max_retries=-1)
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -242,14 +237,14 @@ class RetryTests(unittest.TestCase):
 
         client._urlopen = opener
 
-        with self.assertRaises(OmniDatastreamError):
+        with self.assertRaises(SecApiError):
             client.health()
         self.assertEqual(attempts, 1)
 
     def test_429_retries_unsafe_method_and_honors_retry_after(self):
         attempts = 0
         retry, delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -267,7 +262,7 @@ class RetryTests(unittest.TestCase):
     def test_429_retry_after_infinity_falls_back_to_backoff(self):
         attempts = 0
         retry, delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -286,7 +281,7 @@ class RetryTests(unittest.TestCase):
         now = 0
         attempts = 0
         retry, _delays = retry_harness(max_retries=0, now=lambda: now)
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -296,11 +291,11 @@ class RetryTests(unittest.TestCase):
         client._urlopen = opener
 
         for _ in range(5):
-            with self.assertRaises(OmniDatastreamError) as ctx:
+            with self.assertRaises(SecApiError) as ctx:
                 client.create_artifact({"kind": "audit"})
             self.assertEqual(ctx.exception.status, 429)
         self.assertEqual(client.circuit_state["state"], "open")
-        with self.assertRaises(OmniDatastreamError) as ctx:
+        with self.assertRaises(SecApiError) as ctx:
             client.create_artifact({"kind": "audit"})
         self.assertEqual(ctx.exception.payload["code"], "client_circuit_open")
         self.assertEqual(attempts, 5)
@@ -309,7 +304,7 @@ class RetryTests(unittest.TestCase):
         attempts = 0
         seen_keys = []
         retry, _delays = retry_harness()
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(request, timeout=None):
             nonlocal attempts
@@ -330,7 +325,7 @@ class RetryTests(unittest.TestCase):
         now = 0
         attempts = 0
         retry, _delays = retry_harness(max_retries=0, now=lambda: now)
-        client = OmniDatastreamClient(retry=retry, telemetry=False)
+        client = SecApiClient(retry=retry, telemetry=False)
 
         def opener(_request, timeout=None):
             nonlocal attempts
@@ -342,10 +337,10 @@ class RetryTests(unittest.TestCase):
         client._urlopen = opener
 
         for _ in range(5):
-            with self.assertRaises(OmniDatastreamError):
+            with self.assertRaises(SecApiError):
                 client.health()
         self.assertEqual(client.circuit_state["state"], "open")
-        with self.assertRaises(OmniDatastreamError) as ctx:
+        with self.assertRaises(SecApiError) as ctx:
             client.health()
         self.assertEqual(ctx.exception.payload["code"], "client_circuit_open")
         self.assertEqual(attempts, 5)
@@ -366,7 +361,7 @@ class RetryTests(unittest.TestCase):
             telemetry_responses.append(response)
             return response
 
-        client = OmniDatastreamClient(
+        client = SecApiClient(
             api_key="ods_secret",
             retry=retry,
             telemetry={"capture_token": "phc_test", "distinct_id": "sdk-test", "opener": telemetry_opener, "sync": True},
@@ -390,7 +385,7 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(payload["api_key"], "phc_test")
         self.assertEqual(payload["distinct_id"], "sdk-test")
         self.assertEqual(payload["properties"]["sdk_language"], "py")
-        self.assertEqual(payload["properties"]["sdk_version"], "0.3.1")
+        self.assertEqual(payload["properties"]["sdk_version"], "0.4.1")
         self.assertEqual(payload["properties"]["route"], "/v1/filings/latest")
         self.assertEqual(payload["properties"]["status"], 502)
         self.assertFalse(payload["properties"]["$process_person_profile"])
@@ -404,7 +399,7 @@ class List13fFilingsTests(unittest.TestCase):
 
     def test_list_13f_filings_routes_to_endpoint(self):
         seen_urls = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             seen_urls.append(request.full_url)
@@ -431,7 +426,7 @@ class List13fFilingsTests(unittest.TestCase):
         # PR; the SDK passes the param transparently so existing callers
         # don't need to wait for both PRs to land in lockstep.
         seen_urls = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             seen_urls.append(request.full_url)
@@ -443,7 +438,7 @@ class List13fFilingsTests(unittest.TestCase):
 
     def test_list_13f_filings_omits_none_params(self):
         seen_urls = []
-        client = OmniDatastreamClient(retry=False, telemetry=False)
+        client = SecApiClient(retry=False, telemetry=False)
 
         def opener(request, timeout=None):
             seen_urls.append(request.full_url)
@@ -454,6 +449,65 @@ class List13fFilingsTests(unittest.TestCase):
         # None-valued params should NOT appear in the URL.
         self.assertNotIn("limit=", seen_urls[0])
         self.assertNotIn("since=", seen_urls[0])
+
+
+class FactorParityWrapperTests(unittest.TestCase):
+    def test_factor_parity_wrappers_route_to_launch_paths(self):
+        seen = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            body = request.data.decode("utf-8") if request.data else ""
+            seen.append((request.get_method(), request.full_url, body))
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.factor_history("MKT/US", range="1y", response_mode="compact")
+        client.factor_sparklines(factors=["MOMENTUM", "VALUE"], points=32)
+        client.factor_extreme_moves(category="style", side="both")
+        client.factor_extreme_pairs(factors=["MOMENTUM", "VALUE"], sort="abs_spread_return")
+        client.factor_valuations(side="tailwind")
+        client.factor_valuation_stocks(factor="VALUE", sort="score")
+        client.factor_pairs(factor1="MOMENTUM", factor2="VALUE")
+        client.factor_pair_history("MOM/US", "VAL/US", response_mode="compact")
+        client.factor_bulk_download(factors=["MOMENTUM"], include="series")
+        client.factor_custom({"symbol": "AAPL"}, params={"response_mode": "compact"})
+        client.portfolio_attribution({"holdings": [{"symbol": "AAPL", "weight": 1}]}, params={"response_mode": "compact"})
+        client.model_factor_analysis({"model": {"id": "draft"}, "holdings": [{"symbol": "AAPL", "weight": 1}]}, params={"response_mode": "compact"})
+        client.portfolio_hedge(
+            {"holdings": [{"symbol": "AAPL", "weight": 1}], "constraints": {"maxHedges": 1}},
+            params={"response_mode": "compact"},
+        )
+
+        paths = [url.split("https://api.secapi.ai", 1)[1].split("?", 1)[0] for _method, url, _body in seen]
+        self.assertEqual(
+            paths,
+            [
+                "/v1/factors/history/MKT%2FUS",
+                "/v1/factors/sparklines",
+                "/v1/factors/extreme-moves",
+                "/v1/factors/extreme-pairs",
+                "/v1/factors/valuations",
+                "/v1/factors/valuations/stocks",
+                "/v1/factors/pairs",
+                "/v1/factors/pair-history/MOM%2FUS/VAL%2FUS",
+                "/v1/factors/bulk-download",
+                "/v1/factors/custom",
+                "/v1/portfolio/attribution",
+                "/v1/models/factor-analysis",
+                "/v1/portfolio/hedge",
+            ],
+        )
+        self.assertIn("response_mode=compact", seen[0][1])
+        self.assertIn("factors=MOMENTUM", seen[1][1])
+        self.assertIn("factors=VALUE", seen[1][1])
+        self.assertIn("include=series", seen[8][1])
+        self.assertIn("response_mode=compact", seen[9][1])
+        self.assertIn("response_mode=compact", seen[12][1])
+        self.assertEqual([method for method, _url, _body in seen[9:]], ["POST", "POST", "POST", "POST"])
+        self.assertNotIn("response_mode", seen[12][2])
+        self.assertIn("constraints", seen[12][2])
 
 
 if __name__ == "__main__":
