@@ -1,12 +1,9 @@
-from secapi_client.client import ResponseView, SecApiClient, SecApiError
+from secapi_client.client import (
+    OmniDatastreamClient,
+    OmniDatastreamError,
+    ResponseView,
+    SecApiClient,
+    SecApiError,
+)
 
-OmniDatastreamClient = SecApiClient
-OmniDatastreamError = SecApiError
-
-__all__ = [
-    "ResponseView",
-    "SecApiClient",
-    "SecApiError",
-    "OmniDatastreamClient",
-    "OmniDatastreamError",
-]
+__all__ = ["OmniDatastreamClient", "OmniDatastreamError", "ResponseView", "SecApiClient", "SecApiError"]

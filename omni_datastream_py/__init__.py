@@ -1,4 +1,4 @@
-from .client import (
+from secapi_client import (
     OmniDatastreamClient,
     OmniDatastreamError,
     ResponseView,

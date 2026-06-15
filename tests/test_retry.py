@@ -5,6 +5,7 @@ from email.message import Message
 from urllib.error import HTTPError, URLError
 
 from secapi_client import SecApiClient, SecApiError
+from secapi_client.client import SDK_VERSION
 
 
 class FakeResponse:
@@ -385,7 +386,7 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(payload["api_key"], "phc_test")
         self.assertEqual(payload["distinct_id"], "sdk-test")
         self.assertEqual(payload["properties"]["sdk_language"], "py")
-        self.assertEqual(payload["properties"]["sdk_version"], "0.4.1")
+        self.assertEqual(payload["properties"]["sdk_version"], SDK_VERSION)
         self.assertEqual(payload["properties"]["route"], "/v1/filings/latest")
         self.assertEqual(payload["properties"]["status"], 502)
         self.assertFalse(payload["properties"]["$process_person_profile"])

@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 #: essentials+citation-pointers shape on supported endpoints.
 ResponseView = Literal["default", "compact", "agent"]
 
-SDK_VERSION = "0.4.1"
+SDK_VERSION = "0.5.0"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
 RETRYABLE_STATUSES = {408, 429, 502, 503, 504}
@@ -650,6 +650,68 @@ class SecApiClient:
             telemetry=telemetry,
         )
 
+    def create_monitor(
+        self,
+        *,
+        name: str,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        search_mode: str | None = None,
+        webhook_url: str | None = None,
+        delivery: dict[str, Any] | None = None,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/v1/monitors",
+            body={
+                "name": name,
+                "query": query,
+                "filters": filters,
+                "searchMode": search_mode,
+                "webhookUrl": webhook_url,
+                "delivery": delivery,
+            },
+            retry=retry,
+            telemetry=telemetry,
+        )
+
+    def list_monitors(self, *, limit: int | None = None) -> dict[str, Any]:
+        return self._request("GET", "/v1/monitors", params={"limit": limit})
+
+    def get_monitor(self, monitor_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/monitors/{quote(monitor_id, safe='')}")
+
+    def update_monitor_delivery(
+        self,
+        monitor_id: str,
+        *,
+        type: str,
+        config: dict[str, Any],
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/monitors/{quote(monitor_id, safe='')}/delivery",
+            body={"type": type, "config": config},
+            retry=retry,
+            telemetry=telemetry,
+        )
+
+    def monitor_matches(self, monitor_id: str, *, limit: int | None = None) -> dict[str, Any]:
+        return self._request("GET", f"/v1/monitors/{quote(monitor_id, safe='')}/matches", params={"limit": limit})
+
+    def delete_monitor(
+        self,
+        monitor_id: str,
+        *,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request("DELETE", f"/v1/monitors/{quote(monitor_id, safe='')}", retry=retry, telemetry=telemetry)
+
     def stream_events(self, stream_id: str, *, cursor: str | None = None, type: str | None = None, limit: int | None = None) -> dict[str, Any]:
         return self._request("GET", f"/v1/stream_subscriptions/{stream_id}/events", params={"cursor": cursor, "type": type, "limit": limit})
 
@@ -680,6 +742,12 @@ class SecApiClient:
     def search_sections(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/sections/search", params=params)
 
+    def semantic_search(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/search/semantic", params=params)
+
+    def search_fulltext(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/search/fulltext", params=params)
+
     def offerings(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/offerings", params=params)
 
@@ -700,6 +768,9 @@ class SecApiClient:
 
     def market_estimates(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/estimates", params=params)
+
+    def market_earnings_calendar(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/market/earnings-calendar", params=params)
 
     def news_stories(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/news/stories", params=params)
@@ -1182,6 +1253,9 @@ class SecApiClient:
     def institutional_ownership_extract(self, *, cik: str, year: int, quarter: int, limit: int | None = None) -> dict[str, Any]:
         return self._request("GET", "/v1/owners/institutional/extract", params={"cik": cik, "year": year, "quarter": quarter, "limit": limit})
 
+    def institutional_holders_by_ticker(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/owners/institutional/ticker", params=params)
+
     def ma_events(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/events/ma", params=params)
 
@@ -1265,6 +1339,44 @@ class SecApiClient:
     ) -> dict[str, Any]:
         return self._request("POST", "/mcp", body=request, retry=retry, telemetry=telemetry)
 
+    def call_mcp_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        id: str | int | None = None,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.mcp(
+            {
+                "jsonrpc": "2.0",
+                "id": id if id is not None else f"{name}-{int(time.time() * 1000)}",
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments or {},
+                },
+            },
+            retry=retry,
+            telemetry=telemetry,
+        )
 
-SecApiClient = SecApiClient
-SecApiError = SecApiError
+    def agent_latest_filing(self, **params: Any) -> dict[str, Any]:
+        return self.latest_filing(**{**params, "view": "agent"})
+
+    def agent_section(self, section_key: str, **params: Any) -> dict[str, Any]:
+        return self.latest_section(section_key, **{"mode": "compact", **params})
+
+    def agent_statement(self, statement_key: str, **params: Any) -> dict[str, Any]:
+        return self.statement_by_key(statement_key, **{**params, "view": "agent"})
+
+    def agent_institutional_holders(self, **params: Any) -> dict[str, Any]:
+        return self.institutional_holders_by_ticker(**{**params, "view": "agent"})
+
+    def agent_form_144(self, **params: Any) -> dict[str, Any]:
+        return self.form_144_filings(**{**params, "view": "agent"})
+
+
+OmniDatastreamClient = SecApiClient
+OmniDatastreamError = SecApiError

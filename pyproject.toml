@@ -1,6 +1,6 @@
 [project]
 name = "secapi-client"
-version = "0.4.1"
+version = "0.5.0"
 description = "Python SDK for SEC API"
 requires-python = ">=3.11"
 readme = "README.md"
@@ -19,4 +19,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["omni_datastream_py", "secapi_client"]
+packages = ["secapi_client", "omni_datastream_py"]
