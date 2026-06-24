@@ -118,7 +118,143 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 400)
         self.assertEqual(attempts, 1)
 
-    def test_per_call_opt_out(self):
+    def test_api_error_exposes_support_diagnostics_from_payload(self):
+        error = SecApiError(
+            400,
+            {
+                "code": "invalid_request",
+                "message": "ticker is required",
+                "requestId": "req_payload_123",
+            },
+        )
+
+        self.assertEqual(error.code, "invalid_request")
+        self.assertEqual(error.message, "ticker is required")
+        self.assertEqual(error.request_id, "req_payload_123")
+        self.assertEqual(error.status_code, 400)
+        self.assertEqual(error.body["code"], "invalid_request")
+        self.assertIs(error.body, error.payload)
+        self.assertIs(error.json_body, error.payload)
+        self.assertEqual(error.error_code, "invalid_request")
+        self.assertEqual(error.requestId, "req_payload_123")
+        self.assertEqual(
+            str(error),
+            "SecApiError(status=400, code=invalid_request, message=ticker is required, request_id=req_payload_123)",
+        )
+
+    def test_api_error_exposes_nested_error_diagnostics(self):
+        error = SecApiError(
+            502,
+            {
+                "request_id": "req_nested_456",
+                "error": {
+                    "code": "mcp_tool_failed",
+                    "message": "hosted tool failed",
+                },
+            },
+        )
+
+        self.assertEqual(error.code, "mcp_tool_failed")
+        self.assertEqual(error.message, "hosted tool failed")
+        self.assertEqual(error.request_id, "req_nested_456")
+
+    def test_api_error_string_omits_request_id_when_missing(self):
+        error = SecApiError(400, {"message": "bad request"})
+
+        self.assertEqual(str(error), "SecApiError(status=400, code=None, message=bad request)")
+
+    def test_api_error_uses_request_id_header_when_payload_omits_it(self):
+        attempts = 0
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            raise http_error(
+                429,
+                {"errorCode": "rate_limited", "detail": "retry later"},
+                {"X-Request-Id": "req_header_789"},
+            )
+
+        client._urlopen = opener
+
+        with self.assertRaises(SecApiError) as ctx:
+            client.health()
+        self.assertEqual(ctx.exception.code, "rate_limited")
+        self.assertEqual(ctx.exception.message, "retry later")
+        self.assertEqual(ctx.exception.request_id, "req_header_789")
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.requestId, "req_header_789")
+        self.assertIn("request_id=req_header_789", str(ctx.exception))
+        self.assertEqual(attempts, 1)
+
+    def test_default_timeout_applies_when_retries_are_disabled(self):
+        timeouts = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(_request, timeout="not-passed"):
+            timeouts.append(timeout)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(timeouts, [30.0])
+
+    def test_custom_timeout_applies_when_retries_are_disabled(self):
+        timeouts = []
+        client = SecApiClient(retry=False, telemetry=False, timeout=7.5)
+
+        def opener(_request, timeout="not-passed"):
+            timeouts.append(timeout)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(timeouts, [7.5])
+
+    def test_timeout_can_be_disabled_for_custom_transport_owners(self):
+        timeouts = []
+        client = SecApiClient(retry=False, telemetry=False, timeout=None)
+
+        def opener(_request, timeout="not-passed"):
+            timeouts.append(timeout)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(timeouts, ["not-passed"])
+
+    def test_timeout_none_omits_urlopen_timeout_even_with_retries_enabled(self):
+        timeouts = []
+        client = SecApiClient(telemetry=False, timeout=None)
+
+        def opener(_request, timeout="not-passed"):
+            timeouts.append(timeout)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(timeouts, ["not-passed"])
+
+    def test_retry_budget_clamps_longer_request_timeout(self):
+        timeouts = []
+        retry, _delays = retry_harness(total_budget_ms=1000, now=lambda: 1_000.0)
+        client = SecApiClient(retry=retry, telemetry=False, timeout=10)
+
+        def opener(_request, timeout="not-passed"):
+            timeouts.append(timeout)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(timeouts, [1.0])
+
+    def test_per_call_opt_out_still_sends_default_timeout(self):
         attempts = 0
         timeouts = []
         retry, _delays = retry_harness()
@@ -135,7 +271,33 @@ class RetryTests(unittest.TestCase):
         with self.assertRaises(SecApiError):
             client.health(retry=False)
         self.assertEqual(attempts, 1)
-        self.assertEqual(timeouts, ["not-passed"])
+        self.assertEqual(timeouts, [30.0])
+
+    def test_get_trace_escapes_trace_id_path_segment(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.get_trace("trace/with spaces"), {"ok": True})
+        self.assertEqual(seen_urls[0], "https://api.secapi.ai/v1/traces/trace%2Fwith%20spaces")
+
+    def test_request_diagnostics_escapes_request_id_path_segment(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.request_diagnostics("req/with spaces"), {"ok": True})
+        self.assertEqual(seen_urls[0], "https://api.secapi.ai/v1/diagnostics/requests/req%2Fwith%20spaces")
 
     def test_unsafe_post_503_requires_opt_in(self):
         attempts = 0

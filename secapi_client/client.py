@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Iterable, Iterator, Literal, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -16,8 +17,9 @@ from urllib.request import Request, urlopen
 #: essentials+citation-pointers shape on supported endpoints.
 ResponseView = Literal["default", "compact", "agent"]
 
-SDK_VERSION = "0.5.0"
+SDK_VERSION = "1.0.0"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
+DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
 RETRYABLE_STATUSES = {408, 429, 502, 503, 504}
 NEVER_RETRY_STATUSES = {400, 401, 403, 404, 422}
@@ -30,17 +32,118 @@ DEFAULT_RETRY_CONFIG = {
     "circuit_breaker_cooldown_ms": 60_000,
 }
 
+T = TypeVar("T")
+
+
+def _env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = _env(name)
+        if value:
+            return value
+    return None
+
+
+def _option(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
 
 @dataclass
 class SecApiError(Exception):
     status: int
     payload: dict[str, Any]
     retry_after_ms: int | None = None
+    headers: dict[str, Any] | None = None
 
     def __str__(self) -> str:
-        message = self.payload.get("message") if isinstance(self.payload, dict) else None
-        code = self.payload.get("code") if isinstance(self.payload, dict) else None
-        return f"SecApiError(status={self.status}, code={code}, message={message})"
+        request_id = self.request_id
+        suffix = f", request_id={request_id}" if request_id else ""
+        return f"SecApiError(status={self.status}, code={self.code}, message={self.message}{suffix})"
+
+    @property
+    def code(self) -> str | None:
+        return _payload_string(self.payload, "code", "errorCode", "error_code") or _nested_error_string(
+            self.payload,
+            "code",
+            "errorCode",
+            "error_code",
+            "type",
+        )
+
+    @property
+    def message(self) -> str | None:
+        return (
+            _payload_string(self.payload, "message", "detail", "title")
+            or _nested_error_string(self.payload, "message", "detail", "title")
+            or _payload_string(self.payload, "error")
+        )
+
+    @property
+    def request_id(self) -> str | None:
+        return _payload_string(self.payload, "requestId", "request_id") or _header_string(
+            self.headers,
+            "request-id",
+            "x-request-id",
+            "x-correlation-id",
+        )
+
+    @property
+    def status_code(self) -> int:
+        return self.status
+
+    @property
+    def body(self) -> dict[str, Any]:
+        return self.payload
+
+    @property
+    def json_body(self) -> dict[str, Any]:
+        return self.payload
+
+    @property
+    def error_code(self) -> str | None:
+        return self.code
+
+    @property
+    def requestId(self) -> str | None:
+        return self.request_id
+
+
+def _payload_string(payload: dict[str, Any], *keys: str) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _nested_error_string(payload: dict[str, Any], *keys: str) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    return _payload_string(error, *keys) if isinstance(error, dict) else None
+
+
+def _header_string(headers: dict[str, Any] | None, *names: str) -> str | None:
+    if not headers:
+        return None
+    normalized = {str(key).lower(): value for key, value in headers.items()}
+    for name in names:
+        value = normalized.get(name.lower())
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 class _ClientCircuitBreaker:
@@ -83,6 +186,21 @@ class _ClientCircuitBreaker:
             }
 
 
+class _ClientNamespace:
+    def __init__(self, client: Any, **methods: str) -> None:
+        self._client = client
+        self._methods = methods
+
+    def __getattr__(self, name: str) -> Any:
+        method_name = self._methods.get(name)
+        if method_name is None:
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+        return getattr(self._client, method_name)
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(super().__dir__()) | set(self._methods))
+
+
 def _parse_retry_after_ms(value: str | None, now_ms: float) -> int | None:
     if not value:
         return None
@@ -116,28 +234,110 @@ def _route_template(path: str) -> str:
     return "/".join(segments)
 
 
+def _default_page_items(page: dict[str, Any]) -> Iterable[Any]:
+    for key in ("data", "items", "results", "sections", "filings"):
+        value = page.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _default_next_cursor(page: dict[str, Any]) -> Any:
+    if page.get("hasMore") is False or page.get("has_more") is False:
+        return None
+    return page.get("nextCursor") if "nextCursor" in page else page.get("next_cursor")
+
+
+def _normalize_cursor(value: Any) -> str | None:
+    if value is None:
+        return None
+    cursor = str(value).strip()
+    return cursor or None
+
+
+def _positive_int_or_none(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(value))
+
+
 class SecApiClient:
     def __init__(
         self,
         api_key: str | None = None,
         bearer_token: str | None = None,
-        base_url: str = "https://api.secapi.ai",
+        base_url: str | None = None,
         api_version: str = "2026-03-19",
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
+        timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self.api_key = api_key
-        self.bearer_token = bearer_token
-        self.base_url = base_url.rstrip("/")
+        self.api_key = _option(api_key) or _first_env("SECAPI_API_KEY", "OMNI_DATASTREAM_API_KEY")
+        self.bearer_token = _option(bearer_token) or _first_env("SECAPI_BEARER_TOKEN", "OMNI_DATASTREAM_BEARER_TOKEN")
+        resolved_base_url = _option(base_url) or _first_env("SECAPI_BASE_URL", "SECAPI_API_BASE_URL", "OMNI_DATASTREAM_BASE_URL", "OMNI_DATASTREAM_API_BASE_URL")
+        self.base_url = (resolved_base_url or "https://api.secapi.ai").rstrip("/")
         self.api_version = api_version
         self.retry = retry
         self.telemetry = telemetry
+        self.timeout = float(timeout) if timeout is not None else None
         self._urlopen = urlopen
         self._circuit_breaker = _ClientCircuitBreaker(
             DEFAULT_RETRY_CONFIG["circuit_breaker_failure_threshold"],
             DEFAULT_RETRY_CONFIG["circuit_breaker_cooldown_ms"],
         )
         self._telemetry_distinct_id = f"py-sdk-{id(self):x}-{int(time.time() * 1000):x}"
+        self.entities = _ClientNamespace(
+            self,
+            resolve="resolve_entity",
+            search="search_entities",
+            paginate="paginate_entities",
+        )
+        self.filings = _ClientNamespace(
+            self,
+            search="search_filings",
+            paginate="paginate_filings",
+            by_accession="filing_by_accession",
+            latest="latest_filing",
+            agent_latest="agent_latest_filing",
+            render_latest="render_latest_filing",
+        )
+        self.sections = _ClientNamespace(
+            self,
+            search="search_sections",
+            paginate="paginate_sections",
+            latest="latest_section",
+            agent_latest="agent_section",
+            by_accession="filing_section_by_accession",
+        )
+        self.search = _ClientNamespace(
+            self,
+            semantic="semantic_search",
+            fulltext="search_fulltext",
+        )
+        self.factors = _ClientNamespace(
+            self,
+            catalog="factor_catalog",
+            returns="factor_returns",
+            history="factor_history",
+            sparklines="factor_sparklines",
+            returns_intraday="factor_returns_intraday",
+            dashboard="factor_dashboard",
+            regime_performance="factor_regime_performance",
+            correlations="factor_correlations",
+            screen="factor_screen",
+            extreme_moves="factor_extreme_moves",
+            extreme_pairs="factor_extreme_pairs",
+            valuations="factor_valuations",
+            valuation_stocks="factor_valuation_stocks",
+            exposures="factor_exposures",
+            decomposition="factor_decomposition",
+            related_stocks="factor_related_stocks",
+            similarity_pack="factor_similarity_pack",
+            pairs="factor_pairs",
+            pair_history="factor_pair_history",
+            bulk_download="factor_bulk_download",
+            custom="factor_custom",
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -186,6 +386,15 @@ class SecApiClient:
         call_options = telemetry if isinstance(telemetry, dict) else {}
         disabled = global_options.get("enabled") is False or call_options.get("enabled") is False
         return disabled, {**global_options, **call_options}
+
+    def _request_timeout_seconds(self, remaining_ms: float) -> float | None:
+        if self.timeout is None:
+            return None
+        candidates = []
+        candidates.append(self.timeout)
+        if math.isfinite(remaining_ms):
+            candidates.append(max(0.001, remaining_ms / 1000))
+        return min(candidates) if candidates else None
 
     def _should_retry(self, method: str, error: Exception, retry_disabled: bool, unsafe_opt_in: bool) -> tuple[bool, int | None, str]:
         if retry_disabled:
@@ -322,7 +531,7 @@ class SecApiClient:
             request = Request(f"{self.base_url}{path}{query}", data=payload, method=method, headers=headers)
 
             try:
-                timeout_seconds = None if not math.isfinite(remaining_ms) else max(0.001, remaining_ms / 1000)
+                timeout_seconds = self._request_timeout_seconds(remaining_ms)
                 response_context = self._urlopen(request) if timeout_seconds is None else self._urlopen(request, timeout=timeout_seconds)
                 with response_context as response:
                     if response.status == 204:
@@ -348,6 +557,7 @@ class SecApiClient:
                     status=error.code,
                     payload=error_payload,
                     retry_after_ms=_parse_retry_after_ms(error.headers.get("Retry-After"), float(now())),
+                    headers=dict(error.headers.items()),
                 )
             except (URLError, TimeoutError, OSError) as error:
                 last_error = error
@@ -419,7 +629,8 @@ class SecApiClient:
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._request("DELETE", f"/v1/api_keys/{key_id}", retry=retry, telemetry=telemetry)
+        encoded_key_id = quote(key_id, safe="")
+        return self._request("DELETE", f"/v1/api_keys/{encoded_key_id}", retry=retry, telemetry=telemetry)
 
     def create_agent_bootstrap_token(
         self,
@@ -543,16 +754,20 @@ class SecApiClient:
         )
 
     def request_diagnostics(self, request_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/diagnostics/requests/{request_id}")
+        encoded_request_id = quote(request_id, safe="")
+        return self._request("GET", f"/v1/diagnostics/requests/{encoded_request_id}")
 
     def list_admin_organizations(self, *, q: str | None = None, limit: int | None = None) -> dict[str, Any]:
         return self._request("GET", "/v1/admin/orgs", params={"q": q, "limit": limit})
 
     def get_admin_organization(self, org_id: str, *, limit: int | None = None) -> dict[str, Any]:
-        return self._request("GET", f"/v1/admin/orgs/{org_id}", params={"limit": limit})
+        encoded_org_id = quote(org_id, safe="")
+        return self._request("GET", f"/v1/admin/orgs/{encoded_org_id}", params={"limit": limit})
 
     def get_admin_request_diagnostics(self, org_id: str, request_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/admin/orgs/{org_id}/requests/{request_id}")
+        encoded_org_id = quote(org_id, safe="")
+        encoded_request_id = quote(request_id, safe="")
+        return self._request("GET", f"/v1/admin/orgs/{encoded_org_id}/requests/{encoded_request_id}")
 
     def get_admin_delivery_summary(
         self,
@@ -561,9 +776,10 @@ class SecApiClient:
         since: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
+        encoded_org_id = quote(org_id, safe="")
         return self._request(
             "GET",
-            f"/v1/admin/orgs/{org_id}/deliveries/summary",
+            f"/v1/admin/orgs/{encoded_org_id}/deliveries/summary",
             params={"since": since, "limit": limit},
         )
 
@@ -609,10 +825,21 @@ class SecApiClient:
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", f"/v1/webhook_endpoints/{webhook_id}/rotate_secret", retry=retry, telemetry=telemetry)
+        encoded_webhook_id = quote(webhook_id, safe="")
+        return self._request(
+            "POST",
+            f"/v1/webhook_endpoints/{encoded_webhook_id}/rotate_secret",
+            retry=retry,
+            telemetry=telemetry,
+        )
 
     def list_webhook_deliveries(self, webhook_id: str, *, event_id: str | None = None, limit: int | None = None) -> dict[str, Any]:
-        return self._request("GET", f"/v1/webhook_endpoints/{webhook_id}/deliveries", params={"eventId": event_id, "limit": limit})
+        encoded_webhook_id = quote(webhook_id, safe="")
+        return self._request(
+            "GET",
+            f"/v1/webhook_endpoints/{encoded_webhook_id}/deliveries",
+            params={"eventId": event_id, "limit": limit},
+        )
 
     def replay_webhook_delivery(
         self,
@@ -622,7 +849,14 @@ class SecApiClient:
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", f"/v1/webhook_endpoints/{webhook_id}/deliveries/{delivery_id}/replay", retry=retry, telemetry=telemetry)
+        encoded_webhook_id = quote(webhook_id, safe="")
+        encoded_delivery_id = quote(delivery_id, safe="")
+        return self._request(
+            "POST",
+            f"/v1/webhook_endpoints/{encoded_webhook_id}/deliveries/{encoded_delivery_id}/replay",
+            retry=retry,
+            telemetry=telemetry,
+        )
 
     def list_stream_subscriptions(self) -> dict[str, Any]:
         return self._request("GET", "/v1/stream_subscriptions")
@@ -713,7 +947,60 @@ class SecApiClient:
         return self._request("DELETE", f"/v1/monitors/{quote(monitor_id, safe='')}", retry=retry, telemetry=telemetry)
 
     def stream_events(self, stream_id: str, *, cursor: str | None = None, type: str | None = None, limit: int | None = None) -> dict[str, Any]:
-        return self._request("GET", f"/v1/stream_subscriptions/{stream_id}/events", params={"cursor": cursor, "type": type, "limit": limit})
+        encoded_stream_id = quote(stream_id, safe="")
+        return self._request(
+            "GET",
+            f"/v1/stream_subscriptions/{encoded_stream_id}/events",
+            params={"cursor": cursor, "type": type, "limit": limit},
+        )
+
+    def paginate(
+        self,
+        fetch_page: Callable[..., dict[str, Any]],
+        params: dict[str, Any] | None = None,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Iterator[T]:
+        page_params = dict(params or {})
+        page_limit = _positive_int_or_none(max_pages)
+        item_limit = _positive_int_or_none(max_items)
+        if page_limit == 0 or item_limit == 0:
+            return
+
+        item_reader = get_items or _default_page_items
+        cursor_reader = get_next_cursor or _default_next_cursor
+        seen_cursors: set[str] = set()
+        initial_cursor = _normalize_cursor(page_params.get("cursor"))
+        if initial_cursor:
+            seen_cursors.add(initial_cursor)
+
+        yielded = 0
+        pages = 0
+        while page_limit is None or pages < page_limit:
+            page = fetch_page(**page_params)
+            pages += 1
+            page_item_count = 0
+            for item in item_reader(page):
+                if item_limit is not None and yielded >= item_limit:
+                    return
+                page_item_count += 1
+                yield item
+                yielded += 1
+            if item_limit is not None and yielded >= item_limit:
+                return
+
+            next_cursor = _normalize_cursor(cursor_reader(page))
+            if not next_cursor:
+                return
+            if next_cursor in seen_cursors:
+                raise RuntimeError(f"SEC API pagination cursor repeated: {next_cursor}")
+            if page_item_count == 0:
+                return
+            seen_cursors.add(next_cursor)
+            page_params = {**page_params, "cursor": next_cursor}
 
     def resolve_entity(self, *, ticker: str | None = None, cik: str | None = None, name: str | None = None) -> dict[str, Any]:
         return self._request("GET", "/v1/entities/resolve", params={"ticker": ticker, "cik": cik, "name": name})
@@ -721,11 +1008,48 @@ class SecApiClient:
     def search_entities(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/entities", params=params)
 
+    def paginate_entities(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        return self.paginate(
+            self.search_entities,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
+
     def search_filings(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/filings", params=params)
 
+    def paginate_filings(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        return self.paginate(
+            self.search_filings,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
+
     def filing_by_accession(self, accession_number: str, **params: Any) -> dict[str, Any]:
-        return self._request("GET", f"/v1/filings/{accession_number}", params=params)
+        encoded_accession_number = quote(accession_number, safe="")
+        return self._request("GET", f"/v1/filings/{encoded_accession_number}", params=params)
 
     def latest_filing(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/filings/latest", params=params)
@@ -734,13 +1058,34 @@ class SecApiClient:
         return self._request("GET", "/v1/filings/latest/render", params=params)
 
     def latest_section(self, section_key: str, **params: Any) -> dict[str, Any]:
-        return self._request("GET", f"/v1/filings/latest/sections/{section_key}", params=params)
+        encoded_section_key = quote(section_key, safe="")
+        return self._request("GET", f"/v1/filings/latest/sections/{encoded_section_key}", params=params)
 
     def filing_section_by_accession(self, accession_number: str, section_key: str, **params: Any) -> dict[str, Any]:
-        return self._request("GET", f"/v1/filings/{accession_number}/sections/{section_key}", params=params)
+        encoded_accession_number = quote(accession_number, safe="")
+        encoded_section_key = quote(section_key, safe="")
+        return self._request("GET", f"/v1/filings/{encoded_accession_number}/sections/{encoded_section_key}", params=params)
 
     def search_sections(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/sections/search", params=params)
+
+    def paginate_sections(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        return self.paginate(
+            self.search_sections,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
 
     def semantic_search(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/search/semantic", params=params)
@@ -836,7 +1181,8 @@ class SecApiClient:
         return self._request("GET", "/v1/factors/exposures", params=params)
 
     def stock_loadings(self, ticker: str, **params: Any) -> dict[str, Any]:
-        return self._request("GET", f"/v1/stocks/{ticker}/loadings", params=params)
+        encoded_ticker = quote(ticker, safe="")
+        return self._request("GET", f"/v1/stocks/{encoded_ticker}/loadings", params=params)
 
     def factor_decomposition(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/decomposition", params=params)
@@ -1029,7 +1375,8 @@ class SecApiClient:
         return self._request("GET", "/v1/statements/all", params=params)
 
     def statement_by_key(self, statement_key: str, **params: Any) -> dict[str, Any]:
-        return self._request("GET", f"/v1/statements/{statement_key}", params=params)
+        encoded_statement_key = quote(statement_key, safe="")
+        return self._request("GET", f"/v1/statements/{encoded_statement_key}", params=params)
 
     def company_income_statements(
         self,
@@ -1190,16 +1537,20 @@ class SecApiClient:
         return self._request("GET", "/v1/artifacts/summary")
 
     def get_artifact(self, artifact_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/artifacts/{artifact_id}")
+        encoded_artifact_id = quote(artifact_id, safe="")
+        return self._request("GET", f"/v1/artifacts/{encoded_artifact_id}")
 
     def artifact_manifest(self, artifact_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/artifacts/{artifact_id}/manifest")
+        encoded_artifact_id = quote(artifact_id, safe="")
+        return self._request("GET", f"/v1/artifacts/{encoded_artifact_id}/manifest")
 
     def export_artifact(self, artifact_id: str, *, format: str = "json") -> dict[str, Any]:
-        return self._request("GET", f"/v1/artifacts/{artifact_id}/export", params={"format": format})
+        encoded_artifact_id = quote(artifact_id, safe="")
+        return self._request("GET", f"/v1/artifacts/{encoded_artifact_id}/export", params={"format": format})
 
     def download_artifact(self, artifact_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/artifacts/{artifact_id}/download")
+        encoded_artifact_id = quote(artifact_id, safe="")
+        return self._request("GET", f"/v1/artifacts/{encoded_artifact_id}/download")
 
     def reconcile_artifact(
         self,
@@ -1208,7 +1559,13 @@ class SecApiClient:
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", f"/v1/artifacts/{artifact_id}/reconcile", retry=retry, telemetry=telemetry)
+        encoded_artifact_id = quote(artifact_id, safe="")
+        return self._request(
+            "POST",
+            f"/v1/artifacts/{encoded_artifact_id}/reconcile",
+            retry=retry,
+            telemetry=telemetry,
+        )
 
     def analytics_query(
         self,
@@ -1224,7 +1581,8 @@ class SecApiClient:
         return self._request("GET", "/v1/traces", params={"ids": joined})
 
     def get_trace(self, trace_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/traces/{trace_id}")
+        encoded_trace_id = quote(trace_id, safe="")
+        return self._request("GET", f"/v1/traces/{encoded_trace_id}")
 
     def segmented_revenues(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/statements/segmented-revenues", params=params)
