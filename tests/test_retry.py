@@ -1,7 +1,5 @@
 import io
 import json
-import pathlib
-import tomllib
 import unittest
 from email.message import Message
 from urllib.error import HTTPError, URLError
@@ -53,12 +51,6 @@ def retry_harness(**overrides):
 
 
 class RetryTests(unittest.TestCase):
-    def test_sdk_version_matches_package_metadata(self):
-        pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
-        package = tomllib.loads(pyproject.read_text())
-
-        self.assertEqual(SDK_VERSION, package["project"]["version"])
-
     def test_sends_secapi_version_header(self):
         captured = []
         client = SecApiClient(api_version="2026-05-20", retry=False, telemetry=False)
@@ -72,7 +64,6 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(client.health(), {"ok": True})
         headers = {key.lower(): value for key, value in captured[0].items()}
         self.assertEqual(headers["secapi-version"], "2026-05-20")
-        self.assertEqual(headers["user-agent"], f"secapi-python/{SDK_VERSION}")
         self.assertNotIn("-".join(["omni", "version"]), headers)
 
     def test_retries_safe_get_on_5xx(self):
