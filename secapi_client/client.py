@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 ResponseView = Literal["default", "compact", "agent"]
 
 SDK_VERSION = "1.0.1"
+SDK_USER_AGENT = f"secapi-python/{SDK_VERSION}"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -337,21 +338,6 @@ class SecApiClient:
             pair_history="factor_pair_history",
             bulk_download="factor_bulk_download",
             custom="factor_custom",
-            macro_sensitivity="factor_macro_sensitivity",
-        )
-        self.macro = _ClientNamespace(
-            self,
-            search="macro_search",
-            indicators="macro_indicators",
-            releases="macro_releases",
-            calendar="macro_calendar",
-            forecasts="macro_forecasts",
-            high_signal_pack="macro_high_signal_pack",
-            regimes="macro_regimes",
-            status="macro_status",
-            credit_ratings="macro_credit_ratings",
-            credit_rating="macro_credit_rating",
-            briefing="macro_investment_briefing",
         )
 
     def _headers(self) -> dict[str, str]:
@@ -359,7 +345,7 @@ class SecApiClient:
             "accept": "application/json",
             "content-type": "application/json",
             "secapi-version": self.api_version,
-            "user-agent": f"secapi-python/{SDK_VERSION}",
+            "user-agent": SDK_USER_AGENT,
         }
         if self.bearer_token:
             headers["authorization"] = f"Bearer {self.bearer_token}"
@@ -1138,9 +1124,6 @@ class SecApiClient:
     def macro_search(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/macro/search", params=params)
 
-    def macro_status(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/macro/status", params=params)
-
     def macro_indicators(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/macro/indicators", params=params)
 
@@ -1164,24 +1147,6 @@ class SecApiClient:
 
     def macro_credit_rating(self, country: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/macro/credit-ratings/{quote(country, safe='')}")
-
-    def macro_investment_briefing(
-        self,
-        body: dict[str, Any] | None = None,
-        *,
-        response_mode: str | None = "compact",
-        include: str | None = None,
-        retry: bool | dict[str, Any] | None = None,
-        telemetry: bool | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            "/v1/intelligence/country-report",
-            params={"response_mode": response_mode, "include": include},
-            body=body or {},
-            retry=retry,
-            telemetry=telemetry,
-        )
 
     def factor_catalog(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/catalog", params=params)
@@ -1323,12 +1288,6 @@ class SecApiClient:
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request("POST", "/v1/portfolio/stress-test", params=params, body=body, retry=retry, telemetry=telemetry)
-
-    def portfolio_stress_scenarios(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/portfolio/stress-test/scenarios", params=params)
-
-    def factor_macro_sensitivity(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/factors/macro-sensitivity", params=params)
 
     def strategy_factor_rotation(
         self,
