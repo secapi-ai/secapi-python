@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 ResponseView = Literal["default", "compact", "agent"]
 
 SDK_VERSION = "1.0.1"
+SDK_USER_AGENT = f"secapi-python/{SDK_VERSION}"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -344,7 +345,7 @@ class SecApiClient:
             "accept": "application/json",
             "content-type": "application/json",
             "secapi-version": self.api_version,
-            "user-agent": f"secapi-client/{self.api_version}",
+            "user-agent": SDK_USER_AGENT,
         }
         if self.bearer_token:
             headers["authorization"] = f"Bearer {self.bearer_token}"
