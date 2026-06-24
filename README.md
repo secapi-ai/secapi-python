@@ -13,11 +13,14 @@ pip install secapi-client
 ```python
 from secapi_client import SecApiClient
 
-client = SecApiClient(
-    api_key="ods_test_...",
-    # Optional: override base URL (defaults to https://api.secapi.ai)
-    # base_url="http://127.0.0.1:8787",
-)
+# Reads SECAPI_API_KEY and SECAPI_BASE_URL from the environment by default.
+client = SecApiClient()
+```
+
+You can also pass credentials explicitly:
+
+```python
+client = SecApiClient(api_key="secapi_test_...")
 ```
 
 You can also authenticate with a Bearer token:
@@ -30,7 +33,14 @@ client = SecApiClient(bearer_token="your-bearer-token")
 
 | Variable | Description |
 |----------|-------------|
-| `SECAPI_API_KEY` | Your SEC API key (starts with `ods_`) |
+| `SECAPI_API_KEY` | Your SEC API key (starts with `secapi_test_` or `secapi_live_`) |
+| `SECAPI_BEARER_TOKEN` | Optional OAuth bearer token env var |
+| `SECAPI_BASE_URL` | Optional API base URL override |
+| `SECAPI_API_BASE_URL` | Optional API base URL override alias |
+| `OMNI_DATASTREAM_API_KEY` | Compatibility API key env var |
+| `OMNI_DATASTREAM_BEARER_TOKEN` | Compatibility bearer token env var |
+| `OMNI_DATASTREAM_BASE_URL` | Compatibility base URL override |
+| `OMNI_DATASTREAM_API_BASE_URL` | Compatibility base URL override alias |
 
 ### Configuration Options
 
@@ -42,6 +52,7 @@ client = SecApiClient(bearer_token="your-bearer-token")
 | `api_version` | `2026-03-19` | API version header |
 | `retry` | `None` | Retry configuration, or `False` to disable SDK retries |
 | `telemetry` | `None` | Retry telemetry configuration, or `False` to opt out |
+| `timeout` | `30.0` | Per-request socket timeout in seconds; set `None` only if your own transport layer enforces timeouts |
 
 ## Reliability
 
@@ -53,16 +64,20 @@ The SDK retries transient failures with exponential backoff and jitter. Defaults
 - Retryable failures: network errors, `408`, `429`, `502`, `503`, `504`
 - Never retried: `400`, `401`, `403`, `404`, `422`
 - Backoff: base `200ms`, max `5s`, max retries `3`, total budget `30s`
+- Request timeout: `30s` by default, including when retries are disabled
 - Circuit breaker: opens after 5 consecutive retryable failures, cools down for 60s
 
 Disable retries globally if you already wrap the SDK with your own retry layer:
 
 ```python
 client = SecApiClient(
-    api_key="ods_test_...",
+    api_key="secapi_test_...",
     retry=False,
+    timeout=10,
 )
 ```
+
+Set `timeout=None` only when a custom transport wrapper owns socket deadlines.
 
 Per-call overrides are supported:
 
@@ -85,8 +100,7 @@ Retry telemetry emits anonymous `client_retry_attempt` events to SEC API's telem
 import os
 from secapi_client import SecApiClient
 
-api_key = os.environ["SECAPI_API_KEY"]
-client = SecApiClient(api_key=api_key)
+client = SecApiClient()
 
 # Resolve a company entity
 entity = client.resolve_entity(ticker="AAPL")
@@ -110,16 +124,87 @@ section = client.latest_section(
 print(section)
 ```
 
+### Grouped namespaces
+
+The flat methods remain the complete SDK surface, but common workflows are also
+available under grouped namespaces for easier discovery in notebooks, REPLs, and
+agent tool planners:
+
+```python
+# Flat and grouped calls are equivalent.
+filing = client.filings.latest(ticker="AAPL", form="10-K")
+section = client.sections.agent_latest("item_1a", ticker="AAPL", form="10-K")
+
+results = client.search.semantic(
+    q="supply chain risk",
+    ticker="AAPL",
+    mode="hybrid",
+    view="agent",
+)
+
+history = client.factors.history(
+    "VALUE",
+    range="1y",
+    response_mode="compact",
+    include="trust,series",
+)
+```
+
+Start with `client.entities`, `client.filings`, `client.sections`,
+`client.search`, and `client.factors` when exploring. Use the flat methods when
+you need an endpoint outside those high-signal groups.
+
+### Live agent workflow example
+
+For a production-backed copy/paste path, run the focused example that resolves
+an entity, fetches the latest 10-K, and extracts Item 1A in compact mode:
+
+```bash
+export SECAPI_API_KEY="secapi_live_..."
+PYTHONPATH=packages/sdk-py python3 packages/sdk-py/examples/agent_workflow.py
+```
+
+From the monorepo root, `bun run smoke:sdk-examples` runs the matching
+JavaScript, Python, Go, and Rust examples and asserts that each returns entity,
+filing, and compact-section metadata.
+
+### Auto-pagination
+
+Cursor endpoints can be consumed as Python iterators instead of hand-rolling
+`nextCursor` loops:
+
+```python
+for filing in client.paginate_filings(ticker="AAPL", form="10-K", limit=100):
+    print(filing)
+```
+
+Built-in helpers cover common discovery flows: `paginate_filings`,
+`paginate_sections`, and `paginate_entities`. For other cursor endpoints, use
+the generic helper and pass the page function:
+
+```python
+for event in client.paginate(
+    lambda **params: client.stream_events("stream_123", **params),
+    {"limit": 100},
+    max_items=500,
+):
+    print(event)
+```
+
+If an endpoint returns a non-standard list key, provide `get_items` or
+`get_next_cursor`.
+
 ## Common Use Cases
 
 ### Factor Data and Portfolio Workflows
 
-Use `response_mode="compact"` when you are feeding an agent, LLM, notebook, or UI card and want the smallest useful payload. Add `include="trust"` when you need freshness, methodology, and materialization metadata for citations or launch checks.
+Use `response_mode="compact"` when you are feeding an agent, LLM, notebook, or UI card and want the smallest useful payload. Compact catalog responses still include readiness/proof summaries. Add `include="trust"` only when you need the full trust/provenance envelope plus full methodology/materialization/revision/source-rights objects for citations or checks. For catalog/tool-discovery calls, start narrow with `category` plus `limit` before requesting trust metadata; the full trust envelope can be larger than a simple picker payload.
 
 ```python
 # Factor catalog for picker UIs and agent tool discovery
 catalog = client.factor_catalog(
     category="style",
+    limit=25,
     response_mode="compact",
     include="trust",
 )
@@ -269,14 +354,22 @@ obs = operator_client.observability()
 ```python
 from secapi_client import SecApiClient, SecApiError
 
-client = SecApiClient(api_key="ods_test_...")
+client = SecApiClient(api_key="secapi_test_...")
 
 try:
     result = client.resolve_entity(ticker="INVALID")
 except SecApiError as e:
     print(f"Status: {e.status}")
+    print(f"Code: {e.code}")
+    print(f"Message: {e.message}")
+    print(f"Request ID: {e.request_id}")
     print(f"Payload: {e.payload}")
 ```
+
+For interoperability with common HTTP and SDK error shapes, `SecApiError`
+also exposes `status_code`, `body`, `json_body`, `error_code`, and the camelCase
+`requestId` alias. The string form includes `request_id` when available so logs
+are support-ready without additional formatting.
 
 ## Scope
 
