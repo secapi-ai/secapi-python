@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 #: essentials+citation-pointers shape on supported endpoints.
 ResponseView = Literal["default", "compact", "agent"]
 
-SDK_VERSION = "1.0.0"
+SDK_VERSION = "1.0.1"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -1120,6 +1120,9 @@ class SecApiClient:
     def news_stories(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/news/stories", params=params)
 
+    def macro_search(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/macro/search", params=params)
+
     def macro_indicators(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/macro/indicators", params=params)
 
@@ -1137,6 +1140,12 @@ class SecApiClient:
 
     def macro_regimes(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/macro/regimes", params=params)
+
+    def macro_credit_ratings(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/macro/credit-ratings", params=params)
+
+    def macro_credit_rating(self, country: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/macro/credit-ratings/{quote(country, safe='')}")
 
     def factor_catalog(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/catalog", params=params)
