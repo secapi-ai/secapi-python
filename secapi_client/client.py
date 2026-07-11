@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 #: essentials+citation-pointers shape on supported endpoints.
 ResponseView = Literal["default", "compact", "agent"]
 
-SDK_VERSION = "1.0.1"
+SDK_VERSION = "1.1.0"
 SDK_USER_AGENT = f"secapi-python/{SDK_VERSION}"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -262,6 +262,22 @@ def _positive_int_or_none(value: int | None) -> int | None:
     return max(0, int(value))
 
 
+def _comma_param(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value if item is not None and str(item) != "")
+    return value
+
+
+def _situation_params(params: dict[str, Any]) -> dict[str, Any]:
+    # Retry and telemetry are client controls consumed by _request, never API query parameters.
+    return {
+        key: value if key in {"retry", "telemetry"} else _comma_param(value)
+        for key, value in params.items()
+    }
+
+
 class SecApiClient:
     def __init__(
         self,
@@ -338,6 +354,22 @@ class SecApiClient:
             pair_history="factor_pair_history",
             bulk_download="factor_bulk_download",
             custom="factor_custom",
+        )
+        self.situations = _ClientNamespace(
+            self,
+            list="list_situations",
+            issues="situation_issues",
+            issue="situation_issue",
+            get="get_situation",
+            filings="situation_filings",
+            summary="situation_summary",
+            export="export_situation",
+            feed="situation_feed",
+            calendar="situation_calendar",
+            stats="situation_stats",
+            performance="situation_performance",
+            underwrite="situation_underwriting_pack",
+            by_form="situations_by_form",
         )
 
     def _headers(self) -> dict[str, str]:
@@ -489,7 +521,8 @@ class SecApiClient:
         *,
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        parse_json: bool = True,
+    ) -> Any:
         params, param_options = self._request_options_from_params(params)
         if retry is None:
             retry = param_options.get("retry")
@@ -543,8 +576,8 @@ class SecApiClient:
                     if not raw.strip():
                         if circuit_eligible:
                             self._circuit_breaker.record_success()
-                        return {}
-                    data = json.loads(raw)
+                        return {} if parse_json else ""
+                    data = json.loads(raw) if parse_json else raw
                     if circuit_eligible:
                         self._circuit_breaker.record_success()
                     return data
@@ -1117,6 +1150,69 @@ class SecApiClient:
 
     def market_earnings_calendar(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/earnings-calendar", params=params)
+
+    def list_situations(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations", params=_situation_params(params))
+
+    def situation_issues(self, *, limit: int | None = None, **params: Any) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/v1/situations/issues",
+            params=_situation_params({"limit": limit, **params}),
+        )
+
+    def situation_issue(self, issue: str | int, **params: Any) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/v1/situations/issues/{quote(str(issue), safe='')}",
+            params=_situation_params(params),
+        )
+
+    def get_situation(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}", params=_situation_params(params))
+
+    def situation_filings(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/filings", params=_situation_params(params))
+
+    def situation_summary(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/summary", params=_situation_params(params))
+
+    def export_situation(self, situation_id: str, **params: Any) -> str:
+        return self._request(
+            "GET",
+            f"/v1/situations/{quote(situation_id, safe='')}/export",
+            params=_situation_params(params),
+            parse_json=False,
+        )
+
+    def situation_feed(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/feed", params=_situation_params(params))
+
+    def situation_calendar(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/calendar", params=_situation_params(params))
+
+    def situation_stats(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/stats", params=_situation_params(params))
+
+    def situation_performance(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/performance", params=_situation_params(params))
+
+    def situation_underwriting_pack(
+        self,
+        situation_id: str,
+        *,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/v1/situations/{quote(situation_id, safe='')}/underwriting-pack",
+            retry=retry,
+            telemetry=telemetry,
+        )
+
+    def situations_by_form(self, form: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/by-form/{quote(form, safe='')}", params=_situation_params(params))
 
     def news_stories(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/news/stories", params=params)
