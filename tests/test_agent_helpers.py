@@ -322,6 +322,8 @@ class AgentHelperTests(unittest.TestCase):
         client.situations.calendar(date_types=["vote", "expiry"], days=30, limit=5)
         client.situations.stats(window="30d")
         client.situations.performance(types=["merger", "tender_offer"], group_by="subtype", window="1y")
+        client.situations.underwrite("sit/with spaces")
+        client.situation_underwriting_pack("sit/with spaces")
         client.situations.by_form("SC 13D", statuses=["announced", "pending"], limit=25)
 
         self.assertEqual(markdown, "# Special situation")
@@ -342,6 +344,8 @@ class AgentHelperTests(unittest.TestCase):
                 "https://api.secapi.ai/v1/situations/calendar?date_types=vote%2Cexpiry&days=30&limit=5",
                 "https://api.secapi.ai/v1/situations/stats?window=30d",
                 "https://api.secapi.ai/v1/situations/performance?types=merger%2Ctender_offer&group_by=subtype&window=1y",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/underwriting-pack",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/underwriting-pack",
                 "https://api.secapi.ai/v1/situations/by-form/SC%2013D?statuses=announced%2Cpending&limit=25",
             ],
         )

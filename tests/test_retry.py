@@ -298,7 +298,13 @@ class RetryTests(unittest.TestCase):
 
         with self.assertRaises(SecApiError):
             client.situations.issues(limit=2, retry=False, telemetry=False)
-        self.assertEqual(attempts, 1)
+        with self.assertRaises(SecApiError):
+            client.situations.underwrite(
+                "sit/with spaces",
+                retry=False,
+                telemetry=False,
+            )
+        self.assertEqual(attempts, 2)
 
         seen_urls = []
 
@@ -308,9 +314,8 @@ class RetryTests(unittest.TestCase):
 
         client._urlopen = successful_opener
         self.assertEqual(
-            client.situations.issue(
-                "issue/with spaces",
-                response_mode="compact",
+            client.situation_underwriting_pack(
+                "sit/with spaces",
                 retry=False,
                 telemetry=False,
             ),
@@ -319,7 +324,7 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(
             seen_urls,
             [
-                "https://api.secapi.ai/v1/situations/issues/issue%2Fwith%20spaces?response_mode=compact",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/underwriting-pack",
             ],
         )
 

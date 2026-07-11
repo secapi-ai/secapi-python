@@ -348,6 +348,7 @@ detail = client.situations.get("sit_abc123")
 filings = client.situations.filings("sit_abc123", limit=25)
 summary = client.situations.summary("sit_abc123")
 markdown = client.situations.export("sit_abc123")
+pack = client.situations.underwrite("sit_abc123")
 
 # Feed, calendar, analytics, and form-triggered discovery.
 feed = client.situations.feed(types=["merger"], since="2026-07-01T00:00:00Z")
@@ -362,10 +363,14 @@ issue = client.situations.issue("special-situations-digest-22-2026-07-05")
 ```
 
 The immutable issue archive endpoints, `GET /v1/situations/issues` and
-`GET /v1/situations/issues/{issue}`, depend on unmerged datastream PR
-[#1363](https://github.com/autonomous-computer/omni-datastream/pull/1363).
-They are documented here so SDK users can write against the public contract, but
-production availability depends on that backend PR landing and deploying.
+`GET /v1/situations/issues/{issue}`, plus the underwriting-pack endpoint,
+`GET /v1/situations/{id}/underwriting-pack`, depend on pending datastream PR
+[#1363](https://github.com/autonomous-computer/omni-datastream/pull/1363)
+deployment. They are documented here so SDK users can write against the public
+contract, but production availability depends on that backend deployment. The
+underwriting pack is limited to public Special Situations data and does not
+include internal research notes, TIKR/provider-private data, or other
+non-customer datasets.
 
 ### Offerings and M&A
 

@@ -368,6 +368,7 @@ class SecApiClient:
             calendar="situation_calendar",
             stats="situation_stats",
             performance="situation_performance",
+            underwrite="situation_underwriting_pack",
             by_form="situations_by_form",
         )
 
@@ -1195,6 +1196,20 @@ class SecApiClient:
 
     def situation_performance(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/situations/performance", params=_situation_params(params))
+
+    def situation_underwriting_pack(
+        self,
+        situation_id: str,
+        *,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/v1/situations/{quote(situation_id, safe='')}/underwriting-pack",
+            retry=retry,
+            telemetry=telemetry,
+        )
 
     def situations_by_form(self, form: str, **params: Any) -> dict[str, Any]:
         return self._request("GET", f"/v1/situations/by-form/{quote(form, safe='')}", params=_situation_params(params))
