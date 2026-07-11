@@ -282,6 +282,47 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(attempts, 1)
         self.assertEqual(timeouts, [30.0])
 
+    def test_situations_namespace_preserves_per_call_retry_and_telemetry_controls(self):
+        attempts = 0
+        retry, _delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            self.assertNotIn("retry=", request.full_url)
+            self.assertNotIn("telemetry=", request.full_url)
+            raise http_error(503, {"message": "unavailable"})
+
+        client._urlopen = opener
+
+        with self.assertRaises(SecApiError):
+            client.situations.issues(limit=2, retry=False, telemetry=False)
+        self.assertEqual(attempts, 1)
+
+        seen_urls = []
+
+        def successful_opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = successful_opener
+        self.assertEqual(
+            client.situations.issue(
+                "issue/with spaces",
+                response_mode="compact",
+                retry=False,
+                telemetry=False,
+            ),
+            {"ok": True},
+        )
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://api.secapi.ai/v1/situations/issues/issue%2Fwith%20spaces?response_mode=compact",
+            ],
+        )
+
     def test_get_trace_escapes_trace_id_path_segment(self):
         seen_urls = []
         client = SecApiClient(retry=False, telemetry=False)

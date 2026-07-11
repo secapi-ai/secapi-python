@@ -331,6 +331,42 @@ calendar = client.market_calendar(market="XNYS", duration=3)
 vol = client.volatility_signal(ticker="AAPL")
 ```
 
+### Special Situations
+
+The public Special Situations namespace exposes SEC-derived customer-facing data only. It does not expose internal datasets or provider-private fields.
+
+```python
+# Browse durable situations and inspect the filing timeline.
+situations = client.situations.list(
+    types=["merger", "tender_offer"],
+    statuses=["announced", "pending"],
+    tickers=["AAPL", "MSFT"],
+    limit=10,
+)
+
+detail = client.situations.get("sit_abc123")
+filings = client.situations.filings("sit_abc123", limit=25)
+summary = client.situations.summary("sit_abc123")
+markdown = client.situations.export("sit_abc123")
+
+# Feed, calendar, analytics, and form-triggered discovery.
+feed = client.situations.feed(types=["merger"], since="2026-07-01T00:00:00Z")
+calendar = client.situations.calendar(date_types=["vote", "expiry"], days=30)
+stats = client.situations.stats(window="30d")
+performance = client.situations.performance(types=["merger"], group_by="subtype")
+form_matches = client.situations.by_form("SC 13D", limit=25)
+
+# Paid immutable weekly issue archive.
+issues = client.situations.issues(limit=4)
+issue = client.situations.issue("special-situations-digest-22-2026-07-05")
+```
+
+The immutable issue archive endpoints, `GET /v1/situations/issues` and
+`GET /v1/situations/issues/{issue}`, depend on unmerged datastream PR
+[#1363](https://github.com/autonomous-computer/omni-datastream/pull/1363).
+They are documented here so SDK users can write against the public contract, but
+production availability depends on that backend PR landing and deploying.
+
 ### Offerings and M&A
 
 ```python
@@ -381,6 +417,7 @@ The Python SDK covers the full REST surface including:
 - Factor catalog, returns, history, valuations, exposures, decomposition, pairs, and custom discovery
 - Portfolio factor attribution, hedging, optimization, stress testing, and model factor analysis
 - Offerings, market calendar, and volatility signals
+- Special Situations feed, calendar, stats, performance, and paid immutable issue archive
 - Ownership, insiders, and compensation data
 - Institutional holdings (13F)
 - Enforcement actions and M&A events

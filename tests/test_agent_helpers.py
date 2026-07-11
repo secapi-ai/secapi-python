@@ -22,6 +22,11 @@ class FakeResponse:
     def read(self):
         return json.dumps(self.body).encode("utf-8")
 
+
+class FakeTextResponse(FakeResponse):
+    def read(self):
+        return str(self.body).encode("utf-8")
+
 class AgentHelperTests(unittest.TestCase):
     def test_loads_auth_and_base_url_from_environment_when_constructor_options_are_omitted(self):
         previous = {
@@ -283,6 +288,61 @@ class AgentHelperTests(unittest.TestCase):
                 "https://api.secapi.ai/v1/search/semantic?q=supply+chain+risk&ticker=AAPL&mode=hybrid&view=agent",
                 "https://api.secapi.ai/v1/factors/history/VALUE?range=1y&response_mode=compact&include=trust%2Cseries",
                 "https://api.secapi.ai/v1/factors/dashboard?country=US&category=style&ticker=AAPL&response_mode=compact",
+            ],
+        )
+
+    def test_situations_namespace_reaches_public_customer_routes(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            if request.full_url.endswith("/export?view=agent"):
+                return FakeTextResponse(body="# Special situation")
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.situations.list(
+            types=["merger", "tender_offer"],
+            statuses=("announced", "pending"),
+            tickers=["AAPL", "MSFT"],
+            market_cap="large",
+            announced_from="2026-07-01",
+            enrich=False,
+            limit=10,
+        )
+        client.situations.issues(limit=2)
+        client.situations.issue("special-situations-digest-22-2026-07-05")
+        client.situations.get("sit/with spaces", view="agent")
+        client.situations.filings("sit/with spaces", cursor=20, limit=10)
+        client.situations.summary("sit/with spaces", response_mode="compact")
+        markdown = client.situations.export("sit/with spaces", view="agent")
+        client.situations.feed(types=["merger", "spac"], tickers=["AAPL", "MSFT"], since="2026-07-01T00:00:00Z")
+        client.situations.calendar(date_types=["vote", "expiry"], days=30, limit=5)
+        client.situations.stats(window="30d")
+        client.situations.performance(types=["merger", "tender_offer"], group_by="subtype", window="1y")
+        client.situations.by_form("SC 13D", statuses=["announced", "pending"], limit=25)
+
+        self.assertEqual(markdown, "# Special situation")
+        self.assertEqual(
+            seen_urls,
+            [
+                (
+                    "https://api.secapi.ai/v1/situations?types=merger%2Ctender_offer&statuses=announced%2Cpending"
+                    "&tickers=AAPL%2CMSFT&market_cap=large&announced_from=2026-07-01&enrich=false&limit=10"
+                ),
+                "https://api.secapi.ai/v1/situations/issues?limit=2",
+                "https://api.secapi.ai/v1/situations/issues/special-situations-digest-22-2026-07-05",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces?view=agent",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/filings?cursor=20&limit=10",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/summary?response_mode=compact",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/export?view=agent",
+                "https://api.secapi.ai/v1/situations/feed?types=merger%2Cspac&tickers=AAPL%2CMSFT&since=2026-07-01T00%3A00%3A00Z",
+                "https://api.secapi.ai/v1/situations/calendar?date_types=vote%2Cexpiry&days=30&limit=5",
+                "https://api.secapi.ai/v1/situations/stats?window=30d",
+                "https://api.secapi.ai/v1/situations/performance?types=merger%2Ctender_offer&group_by=subtype&window=1y",
+                "https://api.secapi.ai/v1/situations/by-form/SC%2013D?statuses=announced%2Cpending&limit=25",
             ],
         )
 
