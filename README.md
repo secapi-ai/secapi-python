@@ -1,32 +1,39 @@
 # SEC API Python SDK
 
-Python SDK for [SEC API](https://secapi.ai/developers) -- factor data, SEC filings, financial statements, ownership data, and more.
+Query SEC filings, financial statements, ownership, and factor data from Python.
 
-## Installation
+[Documentation](https://docs.secapi.ai/python-sdk) · [Get an API key](https://secapi.ai/signup) · [API status](https://status.secapi.ai)
+
+## Install
 
 ```bash
 pip install secapi-client
 ```
 
-## Configuration
+Requires Python 3.11 or newer.
+
+## First request
+
+Set your API key:
+
+```bash
+export SECAPI_API_KEY="secapi_live_..."
+```
+
+Then create a client and fetch Apple's latest 10-K:
 
 ```python
 from secapi_client import SecApiClient
 
-# Reads SECAPI_API_KEY and SECAPI_BASE_URL from the environment by default.
 client = SecApiClient()
+filing = client.agent_latest_filing(ticker="AAPL", form="10-K")
+print(filing)
 ```
 
-You can also pass credentials explicitly:
+`SecApiClient()` reads `SECAPI_API_KEY` and `SECAPI_BASE_URL` from the environment. You can also pass a key explicitly:
 
 ```python
-client = SecApiClient(api_key="secapi_test_...")
-```
-
-You can also authenticate with a Bearer token:
-
-```python
-client = SecApiClient(bearer_token="your-bearer-token")
+client = SecApiClient(api_key="secapi_live_...")
 ```
 
 ### Environment Variables
