@@ -1,46 +1,46 @@
 # SEC API Python SDK
 
-Use SEC API from Python to retrieve SEC filings, company data, financial statements, ownership data, and more.
+Retrieve source-linked SEC filings and company data from Python.
 
 ## Install
 
 ```bash
-pip install secapi-client
+python -m pip install secapi-client
 ```
 
-## Make a request
+## Get a cited filing
 
-Create an API key in the [SEC API dashboard](https://secapi.ai/signup), then keep it in an environment variable. Do not place API keys in source code or commit them to a repository.
+Create an API key in the [SEC API dashboard](https://secapi.ai/signup) and export it. `SecApiClient` reads `SECAPI_API_KEY` and sends it as the `x-api-key` request header.
 
 ```bash
 export SECAPI_API_KEY="secapi_live_..."
 ```
 
 ```python
-import os
-
 from secapi_client import SecApiClient
 
-client = SecApiClient(api_key=os.environ["SECAPI_API_KEY"])
-filing = client.latest_filing(ticker="AAPL", form="10-K")
+client = SecApiClient()
+filing = client.agent_latest_filing(ticker="AAPL", form="10-K")
 
-print(filing["accessionNumber"])
+print(
+    {
+        "accessionNumber": filing.get("accessionNumber"),
+        "filingDate": filing.get("filingDate"),
+        "filingUrl": filing.get("filingUrl"),
+        "requestId": filing.get("requestId"),
+    }
+)
 ```
 
-This requests the most recent Apple 10-K and prints its filing accession number, such as `0000320193-25-000079`. The full `filing` value is a Python dictionary with the filing metadata you can use to retrieve a section or continue with another SEC API workflow.
+This requests the latest Apple 10-K and prints its filing identity, SEC source URL, and request identifier. `agent_latest_filing` uses the compact `view=agent` response: it includes the filing URL but does not include the full provenance, freshness, or materialization metadata. Use `client.latest_filing(ticker="AAPL", form="10-K")` when your workflow needs the default response shape.
 
 ## Documentation and support
 
 - [Python SDK documentation](https://docs.secapi.ai/python-sdk)
-- [Getting started](https://docs.secapi.ai/getting-started)
-- [API reference](https://docs.secapi.ai/api-reference)
+- [Latest filing API reference](https://docs.secapi.ai/api-reference/filings/get-v1-filings-latest)
 - [Report an SDK issue](https://github.com/secapi-ai/secapi-python/issues)
 - [API status](https://status.secapi.ai)
 
 ## Compatibility
 
-Requires Python 3.11 or later. The SDK connects to `https://api.secapi.ai` by default and authenticates API-key requests with `SECAPI_API_KEY`.
-
-## Status
-
-The package version in this release is `1.0.1`. See the [status page](https://status.secapi.ai) for API availability and incident updates.
+Requires Python 3.11 or later. The client connects to `https://api.secapi.ai` by default.
