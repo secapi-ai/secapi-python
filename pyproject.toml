@@ -13,6 +13,7 @@ authors = [
 Homepage = "https://secapi.ai/developers"
 Documentation = "https://docs.secapi.ai"
 Repository = "https://github.com/secapi-ai/secapi-python"
+Issues = "https://github.com/secapi-ai/secapi-python/issues"
 
 [build-system]
 requires = ["setuptools>=68"]

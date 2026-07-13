@@ -24,10 +24,10 @@ from secapi_client import SecApiClient
 client = SecApiClient(api_key=os.environ["SECAPI_API_KEY"])
 filing = client.latest_filing(ticker="AAPL", form="10-K")
 
-print(filing)
+print(filing["accessionNumber"])
 ```
 
-This requests the most recent Apple 10-K and returns the API response as a Python dictionary. Use the returned filing metadata to select a filing, retrieve a section, or continue with another SEC API workflow.
+This requests the most recent Apple 10-K and prints its filing accession number, such as `0000320193-25-000079`. The full `filing` value is a Python dictionary with the filing metadata you can use to retrieve a section or continue with another SEC API workflow.
 
 ## Documentation and support
 

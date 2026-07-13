@@ -215,6 +215,28 @@ class AgentHelperTests(unittest.TestCase):
         self.assertIs(LegacySubmoduleSecApiClient, SecApiClient)
         self.assertIsInstance(OmniDatastreamClient(retry=False, telemetry=False), SecApiClient)
 
+    def test_latest_filing_returns_the_top_level_filing_object(self):
+        client = SecApiClient(retry=False, telemetry=False)
+        response_body = {
+            "object": "filing",
+            "accessionNumber": "0000320193-25-000079",
+            "ticker": "AAPL",
+            "form": "10-K",
+        }
+        seen_urls = []
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body=response_body)
+
+        client._urlopen = opener
+
+        filing = client.latest_filing(ticker="AAPL", form="10-K")
+
+        self.assertEqual(filing, response_body)
+        self.assertEqual(filing["accessionNumber"], "0000320193-25-000079")
+        self.assertEqual(seen_urls, ["https://api.secapi.ai/v1/filings/latest?ticker=AAPL&form=10-K"])
+
     def test_agent_helpers_default_to_compact_agent_response_shapes(self):
         seen_urls = []
         client = SecApiClient(retry=False, telemetry=False)
