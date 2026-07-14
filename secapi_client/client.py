@@ -4,21 +4,43 @@ import json
 import math
 import os
 import random
+import re
+import ssl
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator, Literal, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 #: ``?view=`` response mode. Mirrors the canonical ``ResponseView`` union in
 #: SEC API contracts. Agent mode returns a strictly smaller,
 #: essentials+citation-pointers shape on supported endpoints.
 ResponseView = Literal["default", "compact", "agent"]
 
-SDK_VERSION = "1.0.1"
-SDK_USER_AGENT = f"secapi-python/{SDK_VERSION}"
+_SITUATION_TYPES = frozenset({
+    "merger", "tender_offer", "going_private", "spin_off", "divestiture",
+    "activist_campaign", "restructuring", "bankruptcy", "liquidation",
+    "strategic_review", "capital_return", "capital_raise", "spac", "delisting",
+    "relisting", "litigation", "management_change", "domicile_change",
+    "demutualization", "other",
+})
+_SITUATION_STATUSES = frozenset({"rumored", "announced", "pending", "completed", "terminated", "expired"})
+_SITUATION_SUBTYPES = frozenset({
+    "definitive", "preliminary", "unsolicited", "rumor_response", "scheme_of_arrangement", "spac_merger",
+    "self_tender", "third_party", "exchange_offer", "management_buyout", "sponsor_buyout", "squeeze_out",
+    "spin_off", "split_off", "carve_out_ipo", "asset_sale", "joint_venture", "carve_out", "stake_disclosure",
+    "proxy_contest", "cooperation_agreement", "settlement", "debt_for_equity_swap", "out_of_court", "operational",
+    "chapter_11", "chapter_7", "chapter_15", "administration", "prepackaged", "emergence", "plan_of_liquidation",
+    "dissolution", "formal_alternatives", "sale_process", "buyback_authorization", "special_dividend", "recapitalization",
+    "rights_offering", "public_offering", "private_placement", "pipe", "atm_program", "ipo", "extension",
+    "trust_liquidation", "forced", "voluntary", "uplisting", "otc_relisting", "won", "lost", "settled",
+    "ceo", "cfo", "chair", "board", "redomiciliation",
+})
+_SITUATION_FILTER_KEYS = frozenset({"situationIds", "types", "subtypes", "statuses", "tickers", "sectors"})
+
+SDK_VERSION = "1.1.0"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -66,6 +88,10 @@ class SecApiError(Exception):
     retry_after_ms: int | None = None
     headers: dict[str, Any] | None = None
 
+    def __post_init__(self) -> None:
+        if self.retry_after_ms is None:
+            self.retry_after_ms = _retry_after_ms_from_payload(self.payload)
+
     def __str__(self) -> str:
         request_id = self.request_id
         suffix = f", request_id={request_id}" if request_id else ""
@@ -73,7 +99,7 @@ class SecApiError(Exception):
 
     @property
     def code(self) -> str | None:
-        return _payload_string(self.payload, "code", "errorCode", "error_code") or _nested_error_string(
+        return _payload_string(_nested_error_data(self.payload), "code", "errorCode", "error_code") or _payload_string(self.payload, "code", "errorCode", "error_code") or _nested_error_string(
             self.payload,
             "code",
             "errorCode",
@@ -84,14 +110,15 @@ class SecApiError(Exception):
     @property
     def message(self) -> str | None:
         return (
-            _payload_string(self.payload, "message", "detail", "title")
+            _payload_string(_nested_error_data(self.payload), "message", "detail", "title")
+            or _payload_string(self.payload, "message", "detail", "title")
             or _nested_error_string(self.payload, "message", "detail", "title")
             or _payload_string(self.payload, "error")
         )
 
     @property
     def request_id(self) -> str | None:
-        return _payload_string(self.payload, "requestId", "request_id") or _header_string(
+        return _payload_string(_nested_error_data(self.payload), "requestId", "request_id") or _payload_string(self.payload, "requestId", "request_id") or _header_string(
             self.headers,
             "request-id",
             "x-request-id",
@@ -118,6 +145,34 @@ class SecApiError(Exception):
     def requestId(self) -> str | None:
         return self.request_id
 
+    @property
+    def details(self) -> dict[str, Any]:
+        data = _nested_error_data(self.payload)
+        if isinstance(data, dict):
+            return data
+        details = self.payload.get("details") if isinstance(self.payload, dict) else None
+        return details if isinstance(details, dict) else {}
+
+    @property
+    def hint(self) -> str | None:
+        return _diagnostic_string(self.payload, "hint")
+
+    @property
+    def docs_url(self) -> str | None:
+        return _diagnostic_string(self.payload, "docsUrl", "docs_url")
+
+    @property
+    def docsUrl(self) -> str | None:
+        return self.docs_url
+
+    @property
+    def action(self) -> str | None:
+        return _diagnostic_string(self.payload, "action")
+
+    @property
+    def retryable(self) -> bool | None:
+        return _diagnostic_bool(self.payload, "retryable")
+
 
 def _payload_string(payload: dict[str, Any], *keys: str) -> str | None:
     if not isinstance(payload, dict):
@@ -129,11 +184,76 @@ def _payload_string(payload: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _payload_number(payload: dict[str, Any] | None, *keys: str) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+    return None
+
+
+def _payload_bool(payload: dict[str, Any] | None, *keys: str) -> bool | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def _nested_error_data(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    return data if isinstance(data, dict) else None
+
+
 def _nested_error_string(payload: dict[str, Any], *keys: str) -> str | None:
     if not isinstance(payload, dict):
         return None
     error = payload.get("error")
     return _payload_string(error, *keys) if isinstance(error, dict) else None
+
+
+def _diagnostic_string(payload: dict[str, Any], *keys: str) -> str | None:
+    details = payload.get("details") if isinstance(payload, dict) else None
+    return (
+        _payload_string(_nested_error_data(payload), *keys)
+        or _payload_string(details, *keys)
+        or _payload_string(payload, *keys)
+        or _nested_error_string(payload, *keys)
+    )
+
+
+def _diagnostic_bool(payload: dict[str, Any], *keys: str) -> bool | None:
+    details = payload.get("details") if isinstance(payload, dict) else None
+    return (
+        _payload_bool(_nested_error_data(payload), *keys)
+        if _payload_bool(_nested_error_data(payload), *keys) is not None
+        else _payload_bool(details, *keys)
+        if _payload_bool(details, *keys) is not None
+        else _payload_bool(payload, *keys)
+    )
+
+
+def _retry_after_ms_from_payload(payload: dict[str, Any]) -> int | None:
+    source = _nested_error_data(payload) or payload
+    details = payload.get("details") if isinstance(payload, dict) else None
+    milliseconds = _payload_number(source, "retryAfterMs", "retry_after_ms")
+    if milliseconds is None:
+        milliseconds = _payload_number(details, "retryAfterMs", "retry_after_ms")
+    if milliseconds is not None:
+        return round(milliseconds)
+    seconds = _payload_number(source, "retryAfterSeconds", "retry_after_seconds")
+    if seconds is None:
+        seconds = _payload_number(details, "retryAfterSeconds", "retry_after_seconds")
+    return None if seconds is None else round(seconds * 1000)
 
 
 def _header_string(headers: dict[str, Any] | None, *names: str) -> str | None:
@@ -145,6 +265,18 @@ def _header_string(headers: dict[str, Any] | None, *names: str) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _friendly_tls_error(error: Exception) -> Exception:
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return URLError(
+            "TLS certificate verification failed before SEC API could return an auth or API error. "
+            "On macOS Python installs, run the bundled 'Install Certificates.command' for that Python, "
+            "or install/upgrade certifi and configure your environment to use its CA bundle. "
+            f"Original error: {reason}"
+        )
+    return error
 
 
 class _ClientCircuitBreaker:
@@ -262,6 +394,30 @@ def _positive_int_or_none(value: int | None) -> int | None:
     return max(0, int(value))
 
 
+def _comma_list(value: Any) -> Any:
+    """Join list/tuple query values into the comma-list form the API expects."""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item) for item in value)
+    return value
+
+
+def _query_bool(value: Any) -> Any:
+    """Coerce Python bools to lowercase "true"/"false" (urlencode emits "True")."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse to follow redirects so 3xx responses raise HTTPError with Location intact."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 - urllib handler signature
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+
+
 class SecApiClient:
     def __init__(
         self,
@@ -282,6 +438,9 @@ class SecApiClient:
         self.telemetry = telemetry
         self.timeout = float(timeout) if timeout is not None else None
         self._urlopen = urlopen
+        # PDF document requests must surface the presigned redirect URL instead
+        # of following it; stubbable in tests like _urlopen.
+        self._urlopen_no_redirect = _NO_REDIRECT_OPENER.open
         self._circuit_breaker = _ClientCircuitBreaker(
             DEFAULT_RETRY_CONFIG["circuit_breaker_failure_threshold"],
             DEFAULT_RETRY_CONFIG["circuit_breaker_cooldown_ms"],
@@ -325,7 +484,6 @@ class SecApiClient:
             dashboard="factor_dashboard",
             regime_performance="factor_regime_performance",
             correlations="factor_correlations",
-            screen="factor_screen",
             extreme_moves="factor_extreme_moves",
             extreme_pairs="factor_extreme_pairs",
             valuations="factor_valuations",
@@ -339,19 +497,90 @@ class SecApiClient:
             bulk_download="factor_bulk_download",
             custom="factor_custom",
         )
+        self.fund_letters = _ClientNamespace(
+            self,
+            list="list_fund_letters",
+            search="search_fund_letters",
+            semantic="semantic_search_fund_letters",
+            get="get_fund_letter",
+            document="get_fund_letter_document",
+            theses="list_fund_letter_theses",
+            managers="list_fund_letter_managers",
+            manager_get="get_fund_letter_manager",
+            manager_overview="get_fund_manager_overview",
+            funds="list_fund_letter_funds",
+            fund_get="get_fund_letter_fund",
+            companies="list_fund_letter_companies",
+            changes="list_fund_letter_changes",
+            paginate="iter_fund_letters",
+            paginate_theses="iter_fund_letter_theses",
+        )
+        self.situations = _ClientNamespace(
+            self,
+            list="list_situations",
+            get="get_situation",
+            by_form="situations_by_form",
+            feed="situations_feed",
+            feed_rss="situations_feed_rss",
+            issues="situations_issues",
+            issue="situation_issue",
+            calendar="situations_calendar",
+            stats="situations_stats",
+            performance="situations_performance",
+            filings="situation_filings",
+            summary="situation_summary",
+            export="export_situation",
+            underwrite="underwrite_situation",
+            watch="watch_situations",
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {
             "accept": "application/json",
             "content-type": "application/json",
             "secapi-version": self.api_version,
-            "user-agent": SDK_USER_AGENT,
+            "user-agent": f"secapi-python/{SDK_VERSION}",
         }
         if self.bearer_token:
             headers["authorization"] = f"Bearer {self.bearer_token}"
         if self.api_key:
             headers["x-api-key"] = self.api_key
         return headers
+
+    @staticmethod
+    def _situation_params(params: dict[str, Any]) -> dict[str, Any]:
+        """The REST situations plane uses comma-separated query filters, not repeated keys."""
+        return {
+            key: ",".join(str(item) for item in value) if isinstance(value, (list, tuple)) else value
+            for key, value in params.items()
+        }
+
+    @staticmethod
+    def _validated_situation_filters(filters: dict[str, Any]) -> dict[str, list[str]]:
+        unknown = set(filters) - _SITUATION_FILTER_KEYS
+        if unknown:
+            raise ValueError(f"situations.watch has unsupported filter keys: {', '.join(sorted(unknown))}")
+        normalized: dict[str, list[str]] = {}
+        for key, raw in filters.items():
+            if not isinstance(raw, (list, tuple)) or not raw:
+                raise ValueError(f"situations.watch filter {key} must be a non-empty list")
+            values = [str(value).strip() for value in raw]
+            if any(not value for value in values):
+                raise ValueError(f"situations.watch filter {key} cannot contain blank values")
+            normalized[key] = values
+        if not normalized:
+            raise ValueError("situations.watch requires at least one non-empty list filter")
+        if len(normalized.get("types", [])) > 50 or any(value not in _SITUATION_TYPES for value in normalized.get("types", [])):
+            raise ValueError("situations.watch types must be canonical situation types (maximum 50)")
+        if len(normalized.get("subtypes", [])) > 100 or any(value not in _SITUATION_SUBTYPES for value in normalized.get("subtypes", [])):
+            raise ValueError("situations.watch subtypes must be canonical situation subtypes (maximum 100)")
+        if len(normalized.get("statuses", [])) > 10 or any(value not in _SITUATION_STATUSES for value in normalized.get("statuses", [])):
+            raise ValueError("situations.watch statuses must be canonical lifecycle statuses (maximum 10)")
+        if len(normalized.get("situationIds", [])) > 50 or any(not re.fullmatch(r"sit_[a-f0-9]{20}", value) for value in normalized.get("situationIds", [])):
+            raise ValueError("situations.watch situationIds must be canonical ids (maximum 50)")
+        if len(normalized.get("tickers", [])) > 200 or len(normalized.get("sectors", [])) > 200:
+            raise ValueError("situations.watch tickers and sectors allow at most 200 values")
+        return normalized
 
     @property
     def circuit_state(self) -> dict[str, Any]:
@@ -402,6 +631,8 @@ class SecApiClient:
             return False, None, "disabled"
         if isinstance(error, SecApiError):
             status = error.status
+            if error.retryable is False:
+                return False, status, "non_retryable_status"
             if status in NEVER_RETRY_STATUSES:
                 return False, status, "non_retryable_status"
             if status not in RETRYABLE_STATUSES:
@@ -489,7 +720,8 @@ class SecApiClient:
         *,
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        response_format: Literal["json", "text"] = "json",
+    ) -> dict[str, Any] | str:
         params, param_options = self._request_options_from_params(params)
         if retry is None:
             retry = param_options.get("retry")
@@ -538,8 +770,12 @@ class SecApiClient:
                     if response.status == 204:
                         if circuit_eligible:
                             self._circuit_breaker.record_success()
-                        return {}
+                        return "" if response_format == "text" else {}
                     raw = response.read().decode("utf-8")
+                    if response_format == "text":
+                        if circuit_eligible:
+                            self._circuit_breaker.record_success()
+                        return raw
                     if not raw.strip():
                         if circuit_eligible:
                             self._circuit_breaker.record_success()
@@ -561,14 +797,14 @@ class SecApiClient:
                     headers=dict(error.headers.items()),
                 )
             except (URLError, TimeoutError, OSError) as error:
-                last_error = error
+                last_error = _friendly_tls_error(error)
 
             retryable, status, reason = self._should_retry(method, last_error, retry_disabled, unsafe_opt_in)
             if not retryable or attempt >= max_retries:
                 if retryable and circuit_eligible:
                     self._circuit_breaker.record_failure(float(now()))
                 raise last_error
-            delay_ms = self._retry_delay_ms(attempt, last_error.retry_after_ms if isinstance(last_error, SecApiError) and status == 429 else None, retry_options)
+            delay_ms = self._retry_delay_ms(attempt, last_error.retry_after_ms if isinstance(last_error, SecApiError) else None, retry_options)
             elapsed_after_attempt_ms = float(now()) - started_at
             if elapsed_after_attempt_ms + delay_ms > total_budget_ms:
                 if circuit_eligible:
@@ -727,7 +963,7 @@ class SecApiClient:
     def limits(self) -> dict[str, Any]:
         return self._request("GET", "/v1/limits")
 
-    def events(
+    def delivery_events(
         self,
         *,
         kind: str | None = None,
@@ -736,9 +972,9 @@ class SecApiClient:
         since: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        return self._request("GET", "/v1/events", params={"kind": kind, "type": type, "requestId": request_id, "since": since, "limit": limit})
+        return self._request("GET", "/v1/delivery/events", params={"kind": kind, "type": type, "requestId": request_id, "since": since, "limit": limit})
 
-    def export_events(
+    def export_delivery_events(
         self,
         *,
         kind: str | None = None,
@@ -750,9 +986,32 @@ class SecApiClient:
     ) -> dict[str, Any]:
         return self._request(
             "GET",
-            "/v1/events/export",
+            "/v1/delivery/events/export",
             params={"kind": kind, "type": type, "requestId": request_id, "since": since, "limit": limit, "format": format},
         )
+
+    def events(
+        self,
+        *,
+        kind: str | None = None,
+        type: str | None = None,
+        request_id: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self.delivery_events(kind=kind, type=type, request_id=request_id, since=since, limit=limit)
+
+    def export_events(
+        self,
+        *,
+        kind: str | None = None,
+        type: str | None = None,
+        request_id: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+        format: str = "json",
+    ) -> dict[str, Any]:
+        return self.export_delivery_events(kind=kind, type=type, request_id=request_id, since=since, limit=limit, format=format)
 
     def request_diagnostics(self, request_id: str) -> dict[str, Any]:
         encoded_request_id = quote(request_id, safe="")
@@ -892,22 +1151,26 @@ class SecApiClient:
         query: str,
         filters: dict[str, Any] | None = None,
         search_mode: str | None = None,
+        start_at: str | None = None,
         webhook_url: str | None = None,
         delivery: dict[str, Any] | None = None,
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        body = {
+            "name": name,
+            "query": query,
+            "filters": filters,
+            "searchMode": search_mode,
+            "webhookUrl": webhook_url,
+            "delivery": delivery,
+        }
+        if start_at is not None:
+            body["startAt"] = start_at
         return self._request(
             "POST",
             "/v1/monitors",
-            body={
-                "name": name,
-                "query": query,
-                "filters": filters,
-                "searchMode": search_mode,
-                "webhookUrl": webhook_url,
-                "delivery": delivery,
-            },
+            body=body,
             retry=retry,
             telemetry=telemetry,
         )
@@ -1112,9 +1375,6 @@ class SecApiClient:
     def market_reference(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/reference", params=params)
 
-    def market_estimates(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/market/estimates", params=params)
-
     def market_earnings_calendar(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/earnings-calendar", params=params)
 
@@ -1171,9 +1431,6 @@ class SecApiClient:
 
     def factor_correlations(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/correlations", params=params)
-
-    def factor_screen(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/factors/screen", params=params)
 
     def factor_extreme_moves(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/extreme-moves", params=params)
@@ -1297,15 +1554,6 @@ class SecApiClient:
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request("POST", "/v1/strategies/factor-rotation", body=body or {}, retry=retry, telemetry=telemetry)
-
-    def strategy_regime_screen(
-        self,
-        body: dict[str, Any] | None = None,
-        *,
-        retry: bool | dict[str, Any] | None = None,
-        telemetry: bool | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self._request("POST", "/v1/strategies/regime-screen", body=body or {}, retry=retry, telemetry=telemetry)
 
     def intelligence_security(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/intelligence/security", params=params)
@@ -1684,11 +1932,311 @@ class SecApiClient:
     def form_144_filings(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/forms/144", params=params)
 
+    def list_situations(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations", params=self._situation_params(params))
+
+    def get_situation(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}", params=params)
+
+    def situations_by_form(self, form: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/by-form/{quote(form, safe='')}", params=self._situation_params(params))
+
+    def situations_feed(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/feed", params=self._situation_params(params))
+
+    def situations_feed_rss(self, **params: Any) -> str:
+        return str(self._request("GET", "/v1/situations/feed.rss", params=self._situation_params(params), response_format="text"))
+
+    def situations_issues(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/issues", params=params)
+
+    def situation_issue(self, issue: str | int, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/issues/{quote(str(issue), safe='')}", params=params)
+
+    def situations_calendar(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/calendar", params=self._situation_params(params))
+
+    def situations_stats(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/stats", params=params)
+
+    def situations_performance(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/performance", params=self._situation_params(params))
+
+    def situation_filings(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/filings", params=params)
+
+    def situation_summary(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/summary", params=params)
+
+    def export_situation(self, situation_id: str, **params: Any) -> str:
+        return str(
+            self._request(
+                "GET",
+                f"/v1/situations/{quote(situation_id, safe='')}/export",
+                params=params,
+                response_format="text",
+            )
+        )
+
+    def underwrite_situation(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/underwriting-pack", params=params)
+
+    def watch_situations(
+        self,
+        *,
+        filters: dict[str, Any],
+        name: str = "Special Situations watch",
+        delivery: dict[str, Any] | None = None,
+        start_at: str | None = None,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_filters = self._validated_situation_filters(filters)
+        if delivery is None:
+            raise ValueError("situations.watch requires an email or organization webhook delivery destination")
+        if isinstance(delivery.get("email"), str):
+            email = delivery["email"].strip()
+            if not email:
+                raise ValueError("situations.watch email delivery requires a non-empty email")
+            normalized_delivery = {"type": "email", "config": {"to": email}}
+        elif delivery.get("organization_webhook") is True or delivery.get("organizationWebhook") is True:
+            normalized_delivery = {"type": "webhook", "config": {"organizationEventFanout": True}}
+        elif delivery.get("type") in {"email", "webhook"} and isinstance(delivery.get("config"), dict):
+            normalized_delivery = delivery
+        else:
+            raise ValueError("situations.watch delivery must contain email or organization_webhook=True")
+        return self.create_monitor(
+            name=name.strip() or "Special Situations watch",
+            query="situations.watch",
+            search_mode="situation",
+            filters=normalized_filters,
+            start_at=start_at,
+            delivery=normalized_delivery,
+            retry=retry,
+            telemetry=telemetry,
+        )
+
     def company_subsidiaries(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/companies/subsidiaries", params=params)
 
     def earnings_transcripts(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/earnings/transcripts", params=params)
+
+    # ----- Fund Letters plane (Track F) -----
+    # Investor letters from hedge funds, partnerships, and registered funds
+    # (EDGAR N-CSR/N-CSRS), parsed into per-company theses with page-anchored,
+    # machine-verifiable provenance. Dormant behind OMNI_FUND_LETTERS_ENABLED
+    # server-side (404 until the flag flips).
+
+    def list_fund_letters(self, **params: Any) -> dict[str, Any]:
+        """List fund letters (filters: manager_id, fund_id, ticker, cik,
+        letter_type, source, distribution, period, year, quarter,
+        published_from/to, since, sort, limit, cursor, view)."""
+        return self._request("GET", "/v1/fund-letters", params=params)
+
+    def search_fund_letters(self, **params: Any) -> dict[str, Any]:
+        """Full-text search over letter bodies.
+
+        Params: ``q`` (required) plus the index filters ``manager_id``,
+        ``fund_id``, ``ticker``, ``letter_type``, ``source``, ``distribution``,
+        ``period``/``year``/``quarter``, ``published_from``/``published_to``,
+        ``limit`` (<=50). Relevance-ranked top-N (no pagination). Hits carry
+        page-anchored highlights that verify against
+        ``get_fund_letter_document(..., format="markdown")``.
+        """
+        return self._request("GET", "/v1/fund-letters/search", params=params)
+
+    def semantic_search_fund_letters(self, **params: Any) -> dict[str, Any]:
+        """Semantic (vector) search over letter content.
+
+        Params: ``q`` (required), ``top_k`` (<=50), and the same exact-period
+        filter set as ``search_fund_letters`` (``manager_id``, ``fund_id``,
+        ``ticker``, ``letter_type``, ``source``, ``distribution``,
+        ``period``/``year``/``quarter``, ``published_from``/``published_to``).
+        """
+        return self._request("GET", "/v1/fund-letters/semantic", params=params)
+
+    def get_fund_letter(self, letter_id: str, **params: Any) -> dict[str, Any]:
+        """Retrieve one letter (narratives, performance figures, inline theses,
+        cross-links). Superseded/merged ids resolve via aliases."""
+        encoded_letter_id = quote(letter_id, safe="")
+        return self._request("GET", f"/v1/fund-letters/{encoded_letter_id}", params=params)
+
+    def get_fund_letter_document(
+        self,
+        letter_id: str,
+        *,
+        format: str = "markdown",
+        sha: str | None = None,
+        **params: Any,
+    ) -> dict[str, Any]:
+        """Retrieve a letter's document.
+
+        format="markdown" (default) returns the page-segmented JSON document
+        ({pages, sourceSha256, paginationVersion, pageCount}) that provenance
+        anchors verify against byte-for-byte. format="pdf" returns a
+        `fund_letter_document_redirect` dict carrying the presigned R2 / EDGAR
+        redirect URL instead of following it (single no-redirect request that
+        bypasses the retry pipeline). Letters with distribution="third_party"
+        raise SecApiError(403, code="document_not_distributable"). Pass `sha`
+        to retrieve a superseded source variant so historical anchors verify.
+        """
+        if format == "pdf":
+            return self._fund_letter_document_redirect(letter_id, params={"sha": sha, **params})
+        encoded_letter_id = quote(letter_id, safe="")
+        return self._request(
+            "GET",
+            f"/v1/fund-letters/{encoded_letter_id}/document",
+            params={"format": "markdown", "sha": sha, **params},
+        )
+
+    def _fund_letter_document_redirect(self, letter_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        encoded_letter_id = quote(letter_id, safe="")
+        filtered_params = {
+            key: value
+            for key, value in {**params, "format": "pdf"}.items()
+            if value is not None and value != ""
+        }
+        query = f"?{urlencode(filtered_params, doseq=True)}" if filtered_params else ""
+        request = Request(
+            f"{self.base_url}/v1/fund-letters/{encoded_letter_id}/document{query}",
+            method="GET",
+            headers=self._headers(),
+        )
+        try:
+            opener = self._urlopen_no_redirect
+            response_context = opener(request) if self.timeout is None else opener(request, timeout=self.timeout)
+            with response_context as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                # Tolerate a JSON body that carries the target URL directly
+                # (drift-safe against a non-302 server implementation).
+                url = payload.get("url") or payload.get("downloadUrl") or payload.get("download_url") if isinstance(payload, dict) else None
+                if isinstance(url, str) and url:
+                    return {
+                        "object": "fund_letter_document_redirect",
+                        "letterId": letter_id,
+                        "format": "pdf",
+                        "url": url,
+                        "status": response.status,
+                    }
+                raise SecApiError(response.status, {
+                    "code": "client_document_redirect_expected",
+                    "message": "Expected a redirect for fund letter PDF document but received a non-redirect response",
+                })
+        except HTTPError as error:
+            headers = dict(error.headers.items()) if error.headers else {}
+            if 300 <= error.code < 400:
+                location = _header_string(headers, "location")
+                if not location:
+                    raise SecApiError(error.code, {
+                        "code": "client_document_redirect_missing_location",
+                        "message": "Fund letter PDF redirect response did not include a Location header",
+                    }) from error
+                return {
+                    "object": "fund_letter_document_redirect",
+                    "letterId": letter_id,
+                    "format": "pdf",
+                    "url": location,
+                    "status": error.code,
+                }
+            raw_payload = error.read().decode("utf-8", errors="replace")
+            try:
+                error_payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                error_payload = {"message": raw_payload or error.reason}
+            raise SecApiError(
+                status=error.code,
+                payload=error_payload,
+                retry_after_ms=_parse_retry_after_ms(error.headers.get("Retry-After") if error.headers else None, time.time() * 1000),
+                headers=headers,
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise _friendly_tls_error(error) from error
+
+    def list_fund_letter_theses(self, **params: Any) -> dict[str, Any]:
+        """Cross-cutting thesis screen (ticker/cik, manager_id, fund_id,
+        letter_id, relationship comma-list, stance, conviction, period(+from/to),
+        since, sort). List values for `relationship` are joined for you."""
+        if "relationship" in params:
+            params["relationship"] = _comma_list(params["relationship"])
+        return self._request("GET", "/v1/fund-letters/theses", params=params)
+
+    def list_fund_letter_managers(self, **params: Any) -> dict[str, Any]:
+        """List letter-writing managers (q, strategy, has_13f, min_letters, sort)."""
+        if "has_13f" in params:
+            params["has_13f"] = _query_bool(params["has_13f"])
+        return self._request("GET", "/v1/fund-letters/managers", params=params)
+
+    def get_fund_letter_manager(self, manager_id: str, **params: Any) -> dict[str, Any]:
+        encoded_manager_id = quote(manager_id, safe="")
+        return self._request("GET", f"/v1/fund-letters/managers/{encoded_manager_id}", params=params)
+
+    def get_fund_manager_overview(self, manager_id: str, **params: Any) -> dict[str, Any]:
+        """Fund Overview: one token-efficient briefing per manager — canonical
+        name, description, founders, website, coverage counts, and the latest
+        letter's highlights (up to 5 headline theses). The manager twin of
+        ``company_overview``; merged manager ids resolve via aliases."""
+        encoded_manager_id = quote(manager_id, safe="")
+        return self._request("GET", f"/v1/fund-letters/managers/{encoded_manager_id}/overview", params=params)
+
+    def list_fund_letter_funds(self, **params: Any) -> dict[str, Any]:
+        """List funds (optionally one manager's funds via manager_id, q)."""
+        return self._request("GET", "/v1/fund-letters/funds", params=params)
+
+    def get_fund_letter_fund(self, fund_id: str, **params: Any) -> dict[str, Any]:
+        encoded_fund_id = quote(fund_id, safe="")
+        return self._request("GET", f"/v1/fund-letters/funds/{encoded_fund_id}", params=params)
+
+    def list_fund_letter_companies(self, **params: Any) -> dict[str, Any]:
+        """Company coverage index (q, min_theses, period, sort)."""
+        return self._request("GET", "/v1/fund-letters/companies", params=params)
+
+    def list_fund_letter_changes(self, **params: Any) -> dict[str, Any]:
+        """Keyset-paginated delta feed (since, types comma-list, ticker,
+        manager_id, limit). Poll twin of the fund_letter.* webhooks."""
+        if "types" in params:
+            params["types"] = _comma_list(params["types"])
+        return self._request("GET", "/v1/fund-letters/changes", params=params)
+
+    def iter_fund_letters(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        return self.paginate(
+            self.list_fund_letters,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
+
+    def iter_fund_letter_theses(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        return self.paginate(
+            self.list_fund_letter_theses,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
 
     def mcp_info(
         self,

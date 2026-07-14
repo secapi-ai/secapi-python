@@ -20,6 +20,10 @@ class FakeResponse:
         return False
 
     def read(self):
+        if isinstance(self.body, bytes):
+            return self.body
+        if isinstance(self.body, str):
+            return self.body.encode("utf-8")
         return json.dumps(self.body).encode("utf-8")
 
 class AgentHelperTests(unittest.TestCase):
@@ -215,28 +219,6 @@ class AgentHelperTests(unittest.TestCase):
         self.assertIs(LegacySubmoduleSecApiClient, SecApiClient)
         self.assertIsInstance(OmniDatastreamClient(retry=False, telemetry=False), SecApiClient)
 
-    def test_latest_filing_returns_the_top_level_filing_object(self):
-        client = SecApiClient(retry=False, telemetry=False)
-        response_body = {
-            "object": "filing",
-            "accessionNumber": "0000320193-25-000079",
-            "ticker": "AAPL",
-            "form": "10-K",
-        }
-        seen_urls = []
-
-        def opener(request, timeout=None):
-            seen_urls.append(request.full_url)
-            return FakeResponse(body=response_body)
-
-        client._urlopen = opener
-
-        filing = client.latest_filing(ticker="AAPL", form="10-K")
-
-        self.assertEqual(filing, response_body)
-        self.assertEqual(filing["accessionNumber"], "0000320193-25-000079")
-        self.assertEqual(seen_urls, ["https://api.secapi.ai/v1/filings/latest?ticker=AAPL&form=10-K"])
-
     def test_agent_helpers_default_to_compact_agent_response_shapes(self):
         seen_urls = []
         client = SecApiClient(retry=False, telemetry=False)
@@ -320,6 +302,159 @@ class AgentHelperTests(unittest.TestCase):
             client.filings.latest(ticker="MSFT", form="10-Q"),
             {"source": "patched", "params": {"ticker": "MSFT", "form": "10-Q"}},
         )
+
+    def test_situations_namespace_delegates_to_paid_rest_routes(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            if request.full_url.endswith("/export?format=markdown"):
+                return FakeResponse(body="# Example Corp\n\nSource-cited brief.")
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.situations.list(types="merger", statuses="pending", limit=10, response_mode="compact")
+        client.situations.get("sit_123", enrich="false")
+        client.situations.by_form("SC TO-T")
+        client.situations.feed(types="merger", since="2026-07-01T00:00:00.000Z")
+        client.situations.feed_rss(types="merger")
+        client.situations.issues(limit=3)
+        client.situations.issue(22)
+        client.situations.calendar(date_types="vote,expected_close", days=30)
+        client.situations.stats(window="30d")
+        client.situations.performance(group_by="type")
+        client.situations.filings("sit_123", cursor=2, limit=10)
+        client.situations.summary("sit_123")
+        markdown = client.situations.export("sit_123", format="markdown")
+        client.situations.underwrite("sit_123")
+
+        self.assertEqual(markdown, "# Example Corp\n\nSource-cited brief.")
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://api.secapi.ai/v1/situations?types=merger&statuses=pending&limit=10&response_mode=compact",
+                "https://api.secapi.ai/v1/situations/sit_123?enrich=false",
+                "https://api.secapi.ai/v1/situations/by-form/SC%20TO-T",
+                "https://api.secapi.ai/v1/situations/feed?types=merger&since=2026-07-01T00%3A00%3A00.000Z",
+                "https://api.secapi.ai/v1/situations/feed.rss?types=merger",
+                "https://api.secapi.ai/v1/situations/issues?limit=3",
+                "https://api.secapi.ai/v1/situations/issues/22",
+                "https://api.secapi.ai/v1/situations/calendar?date_types=vote%2Cexpected_close&days=30",
+                "https://api.secapi.ai/v1/situations/stats?window=30d",
+                "https://api.secapi.ai/v1/situations/performance?group_by=type",
+                "https://api.secapi.ai/v1/situations/sit_123/filings?cursor=2&limit=10",
+                "https://api.secapi.ai/v1/situations/sit_123/summary",
+                "https://api.secapi.ai/v1/situations/sit_123/export?format=markdown",
+                "https://api.secapi.ai/v1/situations/sit_123/underwriting-pack",
+            ],
+        )
+
+    def test_situations_helpers_escape_opaque_path_segments(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            if request.full_url.endswith("/export"):
+                return FakeResponse(body="# Brief")
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.situations.get("sit/with spaces")
+        client.situations.issue("week 22/final")
+        client.situations.filings("sit/with spaces")
+        client.situations.summary("sit/with spaces")
+        client.situations.export("sit/with spaces")
+        client.situations.underwrite("sit/with spaces")
+
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces",
+                "https://api.secapi.ai/v1/situations/issues/week%2022%2Ffinal",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/filings",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/summary",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/export",
+                "https://api.secapi.ai/v1/situations/sit%2Fwith%20spaces/underwriting-pack",
+            ],
+        )
+
+    def test_situations_helpers_comma_join_multi_value_query_filters(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+        client.situations.list(types=["merger", "spac"], statuses=["pending", "announced"])
+        client.situations.by_form("8-K", tickers=["AAPL", "MSFT"])
+        client.situations.feed(types=["merger", "spac"])
+        client.situations.feed_rss(categories=["m_and_a", "activism"])
+        client.situations.calendar(types=["merger", "spac"], date_types=["vote", "expected_close"])
+        client.situations.performance(types=["merger", "spac"])
+
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://api.secapi.ai/v1/situations?types=merger%2Cspac&statuses=pending%2Cannounced",
+                "https://api.secapi.ai/v1/situations/by-form/8-K?tickers=AAPL%2CMSFT",
+                "https://api.secapi.ai/v1/situations/feed?types=merger%2Cspac",
+                "https://api.secapi.ai/v1/situations/feed.rss?categories=m_and_a%2Cactivism",
+                "https://api.secapi.ai/v1/situations/calendar?types=merger%2Cspac&date_types=vote%2Cexpected_close",
+                "https://api.secapi.ai/v1/situations/performance?types=merger%2Cspac",
+            ],
+        )
+
+    def test_situations_monitoring_uses_generic_monitor_workflow(self):
+        seen = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            body = json.loads(request.data.decode("utf-8"))
+            seen.append({"url": request.full_url, "method": request.get_method(), "body": body})
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.situations.watch(
+            filters={"types": ["merger"], "statuses": ["pending"], "tickers": ["AAPL"]},
+            delivery={"organization_webhook": True},
+        )
+
+        self.assertEqual(
+            seen,
+            [{
+                "url": "https://api.secapi.ai/v1/monitors",
+                "method": "POST",
+                "body": {
+                    "name": "Special Situations watch",
+                    "query": "situations.watch",
+                    "filters": {"types": ["merger"], "statuses": ["pending"], "tickers": ["AAPL"]},
+                    "searchMode": "situation",
+                    "webhookUrl": None,
+                    "delivery": {"type": "webhook", "config": {"organizationEventFanout": True}},
+                },
+            }],
+        )
+
+    def test_situations_watch_rejects_invalid_public_inputs(self):
+        client = SecApiClient(retry=False, telemetry=False)
+
+        with self.assertRaisesRegex(ValueError, "requires at least one"):
+            client.situations.watch(filters={}, delivery={"email": "investor@example.com"})
+        with self.assertRaisesRegex(ValueError, "unsupported filter keys"):
+            client.situations.watch(filters={"unknown": ["value"]}, delivery={"email": "investor@example.com"})
+        with self.assertRaisesRegex(ValueError, "statuses"):
+            client.situations.watch(filters={"statuses": ["not-a-status"]}, delivery={"email": "investor@example.com"})
+        with self.assertRaisesRegex(ValueError, "non-empty email"):
+            client.situations.watch(filters={"types": ["merger"]}, delivery={"email": " "})
+        with self.assertRaisesRegex(ValueError, "requires an email"):
+            client.situations.watch(filters={"types": ["merger"]})
 
     def test_paginate_filings_follows_next_cursor(self):
         seen_urls = []
@@ -734,6 +869,31 @@ class AgentHelperTests(unittest.TestCase):
         self.assertEqual(
             seen_urls[0],
             "https://api.secapi.ai/v1/stream_subscriptions/stream%2Fwith%20spaces/events?cursor=cur_1&type=filing.created&limit=5",
+        )
+
+    def test_delivery_event_helpers_use_canonical_delivery_ledger_routes(self):
+        seen_urls = []
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(request, timeout=None):
+            seen_urls.append(request.full_url)
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        client.events(type="monitor.match", request_id="req_1", since="2026-06-25T00:00:00Z", limit=5)
+        client.export_events(type="monitor.match", format="ndjson", limit=10)
+        client.delivery_events(kind="event", limit=3)
+        client.export_delivery_events(kind="event", format="json", limit=3)
+
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://api.secapi.ai/v1/delivery/events?type=monitor.match&requestId=req_1&since=2026-06-25T00%3A00%3A00Z&limit=5",
+                "https://api.secapi.ai/v1/delivery/events/export?type=monitor.match&limit=10&format=ndjson",
+                "https://api.secapi.ai/v1/delivery/events?kind=event&limit=3",
+                "https://api.secapi.ai/v1/delivery/events/export?kind=event&limit=3&format=json",
+            ],
         )
 
     def test_webhook_helpers_escape_opaque_path_ids(self):

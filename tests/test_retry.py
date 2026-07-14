@@ -134,12 +134,17 @@ class RetryTests(unittest.TestCase):
                 "code": "invalid_request",
                 "message": "ticker is required",
                 "requestId": "req_payload_123",
+                "hint": "Use ticker=AAPL",
+                "docs_url": "https://docs.secapi.ai/entities",
             },
         )
 
         self.assertEqual(error.code, "invalid_request")
         self.assertEqual(error.message, "ticker is required")
         self.assertEqual(error.request_id, "req_payload_123")
+        self.assertEqual(error.hint, "Use ticker=AAPL")
+        self.assertEqual(error.docs_url, "https://docs.secapi.ai/entities")
+        self.assertEqual(error.docsUrl, "https://docs.secapi.ai/entities")
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.body["code"], "invalid_request")
         self.assertIs(error.body, error.payload)
@@ -166,6 +171,54 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(error.code, "mcp_tool_failed")
         self.assertEqual(error.message, "hosted tool failed")
         self.assertEqual(error.request_id, "req_nested_456")
+
+    def test_api_error_exposes_actionable_diagnostics_from_details(self):
+        error = SecApiError(
+            402,
+            {
+                "object": "error",
+                "code": "billing_required",
+                "message": "Attach a card to continue.",
+                "details": {
+                    "billingState": "payg_pending_card",
+                    "action": "resolve_billing_status",
+                    "retryable": False,
+                    "docsUrl": "https://docs.secapi.ai/auth-and-pricing",
+                },
+            },
+        )
+
+        self.assertEqual(error.details["billingState"], "payg_pending_card")
+        self.assertEqual(error.action, "resolve_billing_status")
+        self.assertFalse(error.retryable)
+        self.assertEqual(error.docs_url, "https://docs.secapi.ai/auth-and-pricing")
+
+    def test_api_error_exposes_actionable_diagnostics_from_mcp_error_data(self):
+        error = SecApiError(
+            429,
+            {
+                "error": {
+                    "code": -32005,
+                    "message": "ai_query_quota_exceeded",
+                    "data": {
+                        "code": "ai_query_quota_exceeded",
+                        "message": "Monthly AI query quota exhausted.",
+                        "requestId": "req_mcp_quota",
+                        "action": "wait_for_quota_reset_or_upgrade",
+                        "retryable": False,
+                        "docsUrl": "https://docs.secapi.ai/mcp-workflows#ai-query-quota",
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(error.code, "ai_query_quota_exceeded")
+        self.assertEqual(error.message, "Monthly AI query quota exhausted.")
+        self.assertEqual(error.request_id, "req_mcp_quota")
+        self.assertEqual(error.details["action"], "wait_for_quota_reset_or_upgrade")
+        self.assertEqual(error.action, "wait_for_quota_reset_or_upgrade")
+        self.assertFalse(error.retryable)
+        self.assertEqual(error.docs_url, "https://docs.secapi.ai/mcp-workflows#ai-query-quota")
 
     def test_api_error_string_omits_request_id_when_missing(self):
         error = SecApiError(400, {"message": "bad request"})
@@ -448,6 +501,171 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(client.create_artifact({"kind": "audit"}), {"ok": True})
         self.assertEqual(attempts, 2)
         self.assertEqual(delays, [200])
+
+    def test_429_uses_structured_retry_timing_when_retry_after_is_unavailable(self):
+        attempts = 0
+        retry, delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise http_error(
+                    429,
+                    {
+                        "object": "error",
+                        "code": "rate_limit_exceeded",
+                        "message": "Rate limit exceeded.",
+                        "details": {
+                            "retryAfterSeconds": 3,
+                            "retryable": True,
+                        },
+                    },
+                )
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.create_artifact({"kind": "audit"}), {"ok": True})
+        self.assertEqual(attempts, 2)
+        self.assertEqual(delays, [3000])
+
+    def test_429_retryable_false_is_terminal(self):
+        attempts = 0
+        retry, delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            raise http_error(
+                429,
+                {
+                    "object": "error",
+                    "code": "ai_query_quota_exceeded",
+                    "message": "Monthly AI query quota exhausted.",
+                    "details": {
+                        "retryAfterSeconds": 86_400,
+                        "retryable": False,
+                    },
+                },
+                {"Retry-After": "86400"},
+            )
+
+        client._urlopen = opener
+
+        with self.assertRaises(SecApiError) as ctx:
+            client.create_artifact({"kind": "audit"})
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(delays, [])
+
+    def test_retryable_service_error_uses_structured_retry_timing_when_retry_after_is_unavailable(self):
+        attempts = 0
+        retry, delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise http_error(
+                    503,
+                    {
+                        "object": "error",
+                        "code": "auth_verification_unavailable",
+                        "message": "Auth verification temporarily unavailable.",
+                        "retryAfterMs": 750,
+                    },
+                )
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(attempts, 2)
+        self.assertEqual(delays, [750])
+
+    def test_terminal_mcp_quota_error_exposes_structured_retry_timing(self):
+        client = SecApiClient(retry=False, telemetry=False)
+
+        def opener(_request, timeout=None):
+            raise http_error(
+                429,
+                {
+                    "error": {
+                        "code": -32005,
+                        "message": "ai_query_quota_exceeded",
+                        "data": {
+                            "code": "ai_query_quota_exceeded",
+                            "message": "Monthly AI query quota exhausted.",
+                            "requestId": "req_mcp_quota_body_retry",
+                            "retryAfterSeconds": 86_400,
+                        },
+                    },
+                },
+            )
+
+        client._urlopen = opener
+
+        with self.assertRaises(SecApiError) as ctx:
+            client.call_mcp_tool("intelligence.query", {"query": "AAPL risk"})
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertEqual(ctx.exception.code, "ai_query_quota_exceeded")
+        self.assertEqual(ctx.exception.request_id, "req_mcp_quota_body_retry")
+        self.assertEqual(ctx.exception.retry_after_ms, 86_400_000)
+
+    def test_structured_retry_timing_handles_non_object_and_null_aliases(self):
+        attempts = 0
+        retry, delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise http_error(503, [])
+            if attempts == 2:
+                raise http_error(
+                    503,
+                    {
+                        "retryAfterMs": None,
+                        "retry_after_ms": 50,
+                    },
+                )
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(attempts, 3)
+        self.assertEqual(delays, [200, 50])
+
+    def test_header_retry_after_precedes_structured_zero_retry_timing(self):
+        attempts = 0
+        retry, delays = retry_harness()
+        client = SecApiClient(retry=retry, telemetry=False)
+
+        def opener(_request, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise http_error(
+                    429,
+                    {
+                        "retryAfterSeconds": 10,
+                    },
+                    {"Retry-After": "0"},
+                )
+            return FakeResponse(body={"ok": True})
+
+        client._urlopen = opener
+
+        self.assertEqual(client.create_artifact({"kind": "audit"}), {"ok": True})
+        self.assertEqual(attempts, 2)
+        self.assertEqual(delays, [0])
 
     def test_unsafe_429_terminal_failures_open_circuit(self):
         now = 0
