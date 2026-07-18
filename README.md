@@ -1,24 +1,13 @@
 # SEC API Python SDK
 
-`secapi-client` is the Python client for SEC API filings, filing sections, financial statements, ownership data, and factor data.
+`secapi-client` is the Python client for retrieving source-backed SEC filings, filing sections, financial statements, ownership data, and factor data.
 
-[Documentation](https://docs.secapi.ai) · [Get an API key](https://secapi.ai/signup) · [Support](https://github.com/secapi-ai/secapi-python/issues) · [Status](https://status.secapi.ai)
-
-## Install
+## Install and retrieve a filing
 
 ```bash
-pip install secapi-client
+python -m pip install secapi-client
+export SECAPI_API_KEY="secapi_..."
 ```
-
-## Set your API key
-
-Create an API key in the [SEC API dashboard](https://secapi.ai/signup), then set it in your shell:
-
-```bash
-export SECAPI_API_KEY="secapi_live_..."
-```
-
-## Make a request
 
 Create `first_request.py`:
 
@@ -28,21 +17,23 @@ from secapi_client import SecApiClient
 client = SecApiClient()
 filing = client.agent_latest_filing(ticker="AAPL", form="10-K")
 
-print(filing["accessionNumber"])
-print(filing["filingUrl"])
+print({
+    "accessionNumber": filing.get("accessionNumber"),
+    "filingDate": filing.get("filingDate"),
+    "filingUrl": filing.get("filingUrl"),
+    "requestId": filing.get("requestId"),
+})
 ```
 
-Run `python first_request.py`. It prints the accession number and SEC source URL for Apple's latest matching 10-K. Those values change when a newer filing is available.
+Run `python first_request.py`. It prints the current filing identity and request ID for Apple's latest matching 10-K. Those live values can change when a newer filing is available.
 
-## Configuration and compatibility
+`SecApiClient` sends `SECAPI_API_KEY` as `x-api-key` to `https://api.secapi.ai`. It wraps public REST endpoints; use the [hosted MCP server](https://docs.secapi.ai/mcp-install) separately when your client supports MCP. Keep API keys out of browser code and do not use a machine key as an `Authorization: Bearer` token.
 
-`SecApiClient()` reads `SECAPI_API_KEY` and the optional `SECAPI_BASE_URL` from the environment. `SECAPI_API_BASE_URL` is an alias. Pass `bearer_token` or set `SECAPI_BEARER_TOKEN` only for signed-in account endpoints; standard data requests use an API key.
+## Compatibility and support
 
-Python 3.11 or newer is required. The legacy `OMNI_DATASTREAM_API_KEY`, `OMNI_DATASTREAM_BEARER_TOKEN`, `OMNI_DATASTREAM_BASE_URL`, and `OMNI_DATASTREAM_API_BASE_URL` environment variables remain supported.
+Python 3.11 or newer is required. See the [Python SDK guide](https://docs.secapi.ai/python-sdk) and [API reference](https://docs.secapi.ai/api-reference), check [status](https://status.secapi.ai), or [open an SDK issue](https://github.com/secapi-ai/secapi-python/issues).
 
-Failures raise `SecApiError`, which includes the status, error code, and request ID. Include the request ID when opening a [support issue](https://github.com/secapi-ai/secapi-python/issues).
-
-See the [API documentation](https://docs.secapi.ai) for endpoint coverage, pagination, and retry behavior.
+`SECAPI_BASE_URL` and `SECAPI_API_BASE_URL` can override the default origin. Failures raise `SecApiError`, which includes status, error code, and request ID when supplied. Preserve filing identifiers and request IDs with derived output.
 
 ## License
 
