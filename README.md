@@ -1,6 +1,6 @@
 # SEC API Python SDK
 
-`secapi-client` is the Python client for retrieving source-backed SEC filings, filing sections, financial statements, ownership data, and factor data.
+SEC API provides programmatic access to SEC filings, filing sections, financial statements, ownership data, and factor data. `secapi-client` is its Python client.
 
 ## Install and retrieve a filing
 
@@ -31,7 +31,7 @@ Run `python first_request.py`. It prints the current filing identity and request
 
 ## Compatibility and support
 
-Python 3.11 or newer is required. See the [Python SDK guide](https://docs.secapi.ai/python-sdk) and [API reference](https://docs.secapi.ai/api-reference), check [status](https://status.secapi.ai), or [open an SDK issue](https://github.com/secapi-ai/secapi-python/issues).
+Python 3.11 or newer is required. See the [Python SDK guide](https://docs.secapi.ai/python-sdk) and [API reference](https://docs.secapi.ai/api-reference), review [pricing](https://secapi.ai/pricing), check [status](https://status.secapi.ai), or [open an SDK issue](https://github.com/secapi-ai/secapi-python/issues).
 
 `SECAPI_BASE_URL` and `SECAPI_API_BASE_URL` can override the default origin. Failures raise `SecApiError`, which includes status, error code, and request ID when supplied. Preserve filing identifiers and request IDs with derived output.
 
