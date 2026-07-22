@@ -857,8 +857,6 @@ class FactorParityWrapperTests(unittest.TestCase):
         client.factor_sparklines(factors=["MOMENTUM", "VALUE"], points=32)
         client.factor_extreme_moves(category="style", side="both")
         client.factor_extreme_pairs(factors=["MOMENTUM", "VALUE"], sort="abs_spread_return")
-        client.factor_valuations(side="tailwind")
-        client.factor_valuation_stocks(factor="VALUE", sort="score")
         client.factor_pairs(factor1="MOMENTUM", factor2="VALUE")
         client.factor_pair_history("MOM/US", "VAL/US", response_mode="compact")
         client.factor_bulk_download(factors=["MOMENTUM"], include="series")
@@ -878,8 +876,6 @@ class FactorParityWrapperTests(unittest.TestCase):
                 "/v1/factors/sparklines",
                 "/v1/factors/extreme-moves",
                 "/v1/factors/extreme-pairs",
-                "/v1/factors/valuations",
-                "/v1/factors/valuations/stocks",
                 "/v1/factors/pairs",
                 "/v1/factors/pair-history/MOM%2FUS/VAL%2FUS",
                 "/v1/factors/bulk-download",
@@ -892,12 +888,12 @@ class FactorParityWrapperTests(unittest.TestCase):
         self.assertIn("response_mode=compact", seen[0][1])
         self.assertIn("factors=MOMENTUM", seen[1][1])
         self.assertIn("factors=VALUE", seen[1][1])
-        self.assertIn("include=series", seen[8][1])
-        self.assertIn("response_mode=compact", seen[9][1])
-        self.assertIn("response_mode=compact", seen[12][1])
-        self.assertEqual([method for method, _url, _body in seen[9:]], ["POST", "POST", "POST", "POST"])
-        self.assertNotIn("response_mode", seen[12][2])
-        self.assertIn("constraints", seen[12][2])
+        self.assertIn("include=series", seen[6][1])
+        self.assertIn("response_mode=compact", seen[7][1])
+        self.assertIn("response_mode=compact", seen[10][1])
+        self.assertEqual([method for method, _url, _body in seen[7:]], ["POST", "POST", "POST", "POST"])
+        self.assertNotIn("response_mode", seen[10][2])
+        self.assertIn("constraints", seen[10][2])
 
 
 if __name__ == "__main__":

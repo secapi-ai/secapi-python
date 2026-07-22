@@ -9,10 +9,11 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Iterable, Iterator, Literal, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, urlopen
 
 #: ``?view=`` response mode. Mirrors the canonical ``ResponseView`` union in
 #: SEC API contracts. Agent mode returns a strictly smaller,
@@ -40,7 +41,7 @@ _SITUATION_SUBTYPES = frozenset({
 })
 _SITUATION_FILTER_KEYS = frozenset({"situationIds", "types", "subtypes", "statuses", "tickers", "sectors"})
 
-SDK_VERSION = "1.1.0"
+SDK_VERSION = "2.0.0"
 POSTHOG_CAPTURE_HOST = "https://us.i.posthog.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -272,8 +273,10 @@ def _friendly_tls_error(error: Exception) -> Exception:
     if isinstance(reason, ssl.SSLCertVerificationError):
         return URLError(
             "TLS certificate verification failed before SEC API could return an auth or API error. "
-            "On macOS Python installs, run the bundled 'Install Certificates.command' for that Python, "
-            "or install/upgrade certifi and configure your environment to use its CA bundle. "
+            "api.secapi.ai serves a valid chain, so this is a local CA trust-store gap. "
+            "Fastest fix: install the certifi CA bundle, which the SDK then verifies against automatically — "
+            "`pip install \"secapi-client[tls]\"` (or `pip install certifi`). "
+            "On python.org macOS builds you can instead run that Python's bundled 'Install Certificates.command'. "
             f"Original error: {reason}"
         )
     return error
@@ -418,6 +421,41 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 _NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
 
 
+def _build_ssl_context() -> ssl.SSLContext | None:
+    """Build the TLS trust context the client verifies against.
+
+    api.secapi.ai serves a complete, valid chain (leaf -> Google Trust Services
+    intermediate -> GTS Root R4). The failures some Python callers hit
+    ("unable to get local issuer certificate") are NOT a server defect: raw
+    ``urllib``/``ssl`` verify against the *local* OpenSSL trust store, which on
+    many machines (notably python.org macOS builds whose
+    ``Install Certificates.command`` was never run) lacks the newer roots.
+
+    ``requests`` never sees this because it bundles ``certifi``. This SDK is
+    zero-runtime-dependency by design, so we do the same thing *softly*: when
+    ``certifi`` is importable we start from the interpreter's default context —
+    which loads the OS trust store AND honors ``SSL_CERT_FILE``/``SSL_CERT_DIR`` —
+    and *add* certifi's roots on top (``load_verify_locations`` is additive). That
+    UNION heals machines whose system store lacks current roots without dropping
+    the corporate-proxy / private-CA roots that enterprise environments depend on
+    (passing ``cafile=`` to ``create_default_context`` would trust certifi ONLY and
+    silently break those users).
+
+    Returning ``None`` means "use urllib's default", so the zero-certifi install
+    behaves exactly as before — the friendly TLS error still guides the user. See T-E4.
+    """
+    try:
+        import certifi  # optional; installed transitively by requests, pip, etc.
+    except ImportError:
+        return None
+    try:
+        context = ssl.create_default_context()  # OS store + SSL_CERT_FILE/DIR env
+        context.load_verify_locations(cafile=certifi.where())  # + certifi roots (additive)
+        return context
+    except (OSError, ssl.SSLError):
+        return None
+
+
 class SecApiClient:
     def __init__(
         self,
@@ -437,10 +475,22 @@ class SecApiClient:
         self.retry = retry
         self.telemetry = telemetry
         self.timeout = float(timeout) if timeout is not None else None
-        self._urlopen = urlopen
+        # Verify TLS against the certifi CA bundle when available (see
+        # _build_ssl_context / T-E4). None => urllib's default context, so the
+        # zero-dependency install still works wherever the system store is healthy.
+        self._ssl_context = _build_ssl_context()
+        self._urlopen = (
+            partial(urlopen, context=self._ssl_context)
+            if self._ssl_context is not None
+            else urlopen
+        )
         # PDF document requests must surface the presigned redirect URL instead
         # of following it; stubbable in tests like _urlopen.
-        self._urlopen_no_redirect = _NO_REDIRECT_OPENER.open
+        self._urlopen_no_redirect = (
+            build_opener(_NoRedirectHandler, HTTPSHandler(context=self._ssl_context)).open
+            if self._ssl_context is not None
+            else _NO_REDIRECT_OPENER.open
+        )
         self._circuit_breaker = _ClientCircuitBreaker(
             DEFAULT_RETRY_CONFIG["circuit_breaker_failure_threshold"],
             DEFAULT_RETRY_CONFIG["circuit_breaker_cooldown_ms"],
@@ -486,8 +536,6 @@ class SecApiClient:
             correlations="factor_correlations",
             extreme_moves="factor_extreme_moves",
             extreme_pairs="factor_extreme_pairs",
-            valuations="factor_valuations",
-            valuation_stocks="factor_valuation_stocks",
             exposures="factor_exposures",
             decomposition="factor_decomposition",
             related_stocks="factor_related_stocks",
@@ -514,6 +562,7 @@ class SecApiClient:
             changes="list_fund_letter_changes",
             paginate="iter_fund_letters",
             paginate_theses="iter_fund_letter_theses",
+            paginate_managers="iter_fund_letter_managers",
         )
         self.situations = _ClientNamespace(
             self,
@@ -532,6 +581,21 @@ class SecApiClient:
             export="export_situation",
             underwrite="underwrite_situation",
             watch="watch_situations",
+            watchlists="list_situation_watchlists",
+            watchlist="get_situation_watchlist",
+            create_watchlist="create_situation_watchlist",
+            delete_watchlist="delete_situation_watchlist",
+        )
+        self.embed_situations = _ClientNamespace(
+            self,
+            list="list_embed_situations",
+            feed="embed_situations_feed",
+            feed_rss="embed_situations_feed_rss",
+            stats="embed_situations_stats",
+            get="get_embed_situation",
+            export="export_embed_situation",
+            issues="embed_situation_issues",
+            issue="embed_situation_issue",
         )
 
     def _headers(self) -> dict[str, str]:
@@ -1360,6 +1424,11 @@ class SecApiClient:
     def offerings(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/offerings", params=params)
 
+    # Public market data plane. The first five routes are contract-gated public
+    # surface in services/datastream-api/src/lib/api-surface-registry.ts and are
+    # present in the published public OpenAPI. Market routes registered with
+    # internal-token access deliberately have NO client method here —
+    # see docs/operations/sdk-mirror-publish-triage.md.
     def market_calendar(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/calendar", params=params)
 
@@ -1375,8 +1444,20 @@ class SecApiClient:
     def market_reference(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/market/reference", params=params)
 
-    def market_earnings_calendar(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/market/earnings-calendar", params=params)
+    # `/v1/market/indices` and `/v1/market/indices/constituents` are
+    # operator-access, docs:internal routes that nonetheless shipped in the
+    # published secapi-client 1.1.0 client. OMNI-5546 ports them into the monorepo
+    # source so the destructive mirror sync PRESERVES this live customer surface
+    # instead of deleting it. Signatures match the published 1.1.0 methods exactly.
+    def market_indices(self, *, include_inventory: bool | None = None) -> dict[str, Any]:
+        return self._request("GET", "/v1/market/indices", params={"include_inventory": include_inventory})
+
+    def index_constituents(self, *, index: str | None = None, index_code: str | None = None, cursor: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/v1/market/indices/constituents",
+            params={"index": index, "index_code": index_code, "cursor": cursor, "limit": limit},
+        )
 
     def news_stories(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/news/stories", params=params)
@@ -1437,12 +1518,6 @@ class SecApiClient:
 
     def factor_extreme_pairs(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/extreme-pairs", params=params)
-
-    def factor_valuations(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/factors/valuations", params=params)
-
-    def factor_valuation_stocks(self, **params: Any) -> dict[str, Any]:
-        return self._request("GET", "/v1/factors/valuations/stocks", params=params)
 
     def factor_exposures(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/factors/exposures", params=params)
@@ -1609,16 +1684,6 @@ class SecApiClient:
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request("POST", "/v1/intelligence/footnotes/query", body=body, retry=retry, telemetry=telemetry)
-
-    def market_indices(self, *, include_inventory: bool | None = None) -> dict[str, Any]:
-        return self._request("GET", "/v1/market/indices", params={"include_inventory": include_inventory})
-
-    def index_constituents(self, *, index: str | None = None, index_code: str | None = None, cursor: str | None = None, limit: int | None = None) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            "/v1/market/indices/constituents",
-            params={"index": index, "index_code": index_code, "cursor": cursor, "limit": limit},
-        )
 
     def volatility_signal(self, **params: Any) -> dict[str, Any]:
         return self._request("GET", "/v1/signals/volatility", params=params)
@@ -1981,6 +2046,81 @@ class SecApiClient:
     def underwrite_situation(self, situation_id: str, **params: Any) -> dict[str, Any]:
         return self._request("GET", f"/v1/situations/{quote(situation_id, safe='')}/underwriting-pack", params=params)
 
+    def list_situation_watchlists(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/situations/watchlists", params=params)
+
+    def get_situation_watchlist(self, monitor_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/situations/watchlists/{quote(monitor_id, safe='')}")
+
+    def delete_situation_watchlist(self, monitor_id: str) -> dict[str, Any]:
+        return self._request("DELETE", f"/v1/situations/watchlists/{quote(monitor_id, safe='')}")
+
+    def create_situation_watchlist(
+        self,
+        *,
+        filters: dict[str, Any],
+        delivery: dict[str, Any] | None = None,
+        name: str = "Special Situations watch",
+        start_at: str | None = None,
+        retry: bool | dict[str, Any] | None = None,
+        telemetry: bool | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "name": name.strip() or "Special Situations watch",
+            "query": "situations.watch",
+            "searchMode": "situation",
+            "filters": self._validated_situation_filters(filters),
+        }
+        if delivery is not None:
+            if not self.bearer_token or self.api_key:
+                raise ValueError("situations.watch delivery activation requires a bearer-authenticated client without an API key")
+            if isinstance(delivery.get("email"), str):
+                email = delivery["email"].strip()
+                if not email:
+                    raise ValueError("situations.watch email delivery requires a non-empty email")
+                normalized_delivery = {"type": "email", "config": {"to": email}}
+            elif delivery.get("organization_webhook") is True or delivery.get("organizationWebhook") is True:
+                normalized_delivery = {"type": "webhook", "config": {"organizationEventFanout": True}}
+            elif delivery.get("type") in {"email", "webhook"} and isinstance(delivery.get("config"), dict):
+                normalized_delivery = delivery
+            else:
+                raise ValueError("situations.watch delivery must contain email or organization_webhook=True")
+            body["delivery"] = normalized_delivery
+        if start_at is not None:
+            body["startAt"] = start_at
+        return self._request("POST", "/v1/situations/watchlists", body=body, retry=retry, telemetry=telemetry)
+
+    def list_embed_situations(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/embed/situations", params=self._situation_params(params))
+
+    def embed_situations_feed(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/embed/situations/feed", params=self._situation_params(params))
+
+    def embed_situations_feed_rss(self, **params: Any) -> str:
+        return str(self._request("GET", "/v1/embed/situations/feed.rss", params=self._situation_params(params), response_format="text"))
+
+    def embed_situations_stats(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/embed/situations/stats", params=params)
+
+    def get_embed_situation(self, situation_id: str, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/embed/situations/{quote(situation_id, safe='')}", params=params)
+
+    def export_embed_situation(self, situation_id: str, **params: Any) -> str:
+        return str(
+            self._request(
+                "GET",
+                f"/v1/embed/situations/{quote(situation_id, safe='')}/export",
+                params=params,
+                response_format="text",
+            )
+        )
+
+    def embed_situation_issues(self, **params: Any) -> dict[str, Any]:
+        return self._request("GET", "/v1/embed/situations/issues", params=params)
+
+    def embed_situation_issue(self, issue: str | int, **params: Any) -> dict[str, Any]:
+        return self._request("GET", f"/v1/embed/situations/issues/{quote(str(issue), safe='')}", params=params)
+
     def watch_situations(
         self,
         *,
@@ -1991,9 +2131,15 @@ class SecApiClient:
         retry: bool | dict[str, Any] | None = None,
         telemetry: bool | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        normalized_filters = self._validated_situation_filters(filters)
         if delivery is None:
-            raise ValueError("situations.watch requires an email or organization webhook delivery destination")
+            return self.create_situation_watchlist(
+                filters=filters,
+                name=name,
+                start_at=start_at,
+                retry=retry,
+                telemetry=telemetry,
+            )
+        normalized_filters = self._validated_situation_filters(filters)
         if isinstance(delivery.get("email"), str):
             email = delivery["email"].strip()
             if not email:
@@ -2005,11 +2151,9 @@ class SecApiClient:
             normalized_delivery = delivery
         else:
             raise ValueError("situations.watch delivery must contain email or organization_webhook=True")
-        return self.create_monitor(
-            name=name.strip() or "Special Situations watch",
-            query="situations.watch",
-            search_mode="situation",
+        return self.create_situation_watchlist(
             filters=normalized_filters,
+            name=name,
             start_at=start_at,
             delivery=normalized_delivery,
             retry=retry,
@@ -2166,9 +2310,21 @@ class SecApiClient:
         return self._request("GET", "/v1/fund-letters/theses", params=params)
 
     def list_fund_letter_managers(self, **params: Any) -> dict[str, Any]:
-        """List letter-writing managers (q, strategy, has_13f, min_letters, sort)."""
-        if "has_13f" in params:
-            params["has_13f"] = _query_bool(params["has_13f"])
+        """Fund Directory: list managers with coverage stats, directory
+        references (website/Wikipedia/Grokipedia), and the latest-13F summary.
+
+        Filters: ``q`` (firm or founder/CIO name), ``strategy``, ``has_13f``,
+        ``min_letters``, plus the directory set ``ticker`` (held in the latest
+        13F), ``cik``, ``theme``, ``min_positions``, ``publishes_letters``,
+        ``period`` (YYYYQn 13F quarter), and ``sort`` (``aum_desc`` |
+        ``positions_desc`` | ``letters_desc`` | ``name_asc``). Directory
+        filters/fields are server-side flag-gated — until the directory is
+        enabled the list serves letter-publishing managers with the
+        pre-directory fields only.
+        """
+        for key in ("has_13f", "publishes_letters"):
+            if key in params:
+                params[key] = _query_bool(params[key])
         return self._request("GET", "/v1/fund-letters/managers", params=params)
 
     def get_fund_letter_manager(self, manager_id: str, **params: Any) -> dict[str, Any]:
@@ -2179,7 +2335,9 @@ class SecApiClient:
         """Fund Overview: one token-efficient briefing per manager — canonical
         name, description, founders, website, coverage counts, and the latest
         letter's highlights (up to 5 headline theses). The manager twin of
-        ``company_overview``; merged manager ids resolve via aliases."""
+        ``company_overview``; merged manager ids resolve via aliases. Pass
+        ``include="positions"`` to inline ``latest13F`` (latest canonical 13F,
+        top 10 positions); page beyond them via ``links.holdings13F``."""
         encoded_manager_id = quote(manager_id, safe="")
         return self._request("GET", f"/v1/fund-letters/managers/{encoded_manager_id}/overview", params=params)
 
@@ -2231,6 +2389,26 @@ class SecApiClient:
     ) -> Iterator[T]:
         return self.paginate(
             self.list_fund_letter_theses,
+            params,
+            max_pages=max_pages,
+            max_items=max_items,
+            get_items=get_items,
+            get_next_cursor=get_next_cursor,
+        )
+
+    def iter_fund_letter_managers(
+        self,
+        *,
+        max_pages: int | None = None,
+        max_items: int | None = None,
+        get_items: Callable[[dict[str, Any]], Iterable[T]] | None = None,
+        get_next_cursor: Callable[[dict[str, Any]], Any] | None = None,
+        **params: Any,
+    ) -> Iterator[T]:
+        """Iterate the fund directory (auto-pagination twin of
+        ``list_fund_letter_managers``; same filters)."""
+        return self.paginate(
+            self.list_fund_letter_managers,
             params,
             max_pages=max_pages,
             max_items=max_items,
